@@ -195,4 +195,63 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_changes_run ON signal_changes(detection_run_id);
         CREATE INDEX IF NOT EXISTS idx_changes_type ON signal_changes(change_type);
+
+        CREATE TABLE IF NOT EXISTS risk_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_name TEXT NOT NULL UNIQUE,
+            total_score REAL NOT NULL DEFAULT 0,
+            risk_level TEXT NOT NULL DEFAULT '极低风险',
+            signal_strength_factor REAL NOT NULL DEFAULT 0,
+            signal_strength_score REAL NOT NULL DEFAULT 0,
+            report_frequency_factor REAL NOT NULL DEFAULT 0,
+            report_frequency_score REAL NOT NULL DEFAULT 0,
+            severity_factor REAL NOT NULL DEFAULT 0,
+            severity_score REAL NOT NULL DEFAULT 0,
+            trend_factor REAL NOT NULL DEFAULT 0,
+            trend_score REAL NOT NULL DEFAULT 0,
+            bayesian_risk REAL NOT NULL DEFAULT 0,
+            prediction_trend TEXT DEFAULT '稳',
+            prediction_values TEXT,
+            is_upgrade_alert INTEGER DEFAULT 0,
+            detection_run_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (detection_run_id) REFERENCES detection_runs(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_risk_device ON risk_scores(device_name);
+        CREATE INDEX IF NOT EXISTS idx_risk_level ON risk_scores(risk_level);
+        CREATE INDEX IF NOT EXISTS idx_risk_score ON risk_scores(total_score);
+
+        CREATE TABLE IF NOT EXISTS risk_score_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_name TEXT NOT NULL,
+            total_score REAL NOT NULL,
+            risk_level TEXT NOT NULL,
+            signal_strength_score REAL NOT NULL DEFAULT 0,
+            report_frequency_score REAL NOT NULL DEFAULT 0,
+            severity_score REAL NOT NULL DEFAULT 0,
+            trend_score REAL NOT NULL DEFAULT 0,
+            bayesian_risk REAL NOT NULL DEFAULT 0,
+            detection_run_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (detection_run_id) REFERENCES detection_runs(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_risk_history_device ON risk_score_history(device_name);
+        CREATE INDEX IF NOT EXISTS idx_risk_history_time ON risk_score_history(created_at);
+
+        CREATE TABLE IF NOT EXISTS risk_predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_name TEXT NOT NULL,
+            prediction_date DATE NOT NULL,
+            predicted_score REAL NOT NULL,
+            predicted_level TEXT NOT NULL,
+            prediction_months_ahead INTEGER NOT NULL,
+            model_type TEXT NOT NULL DEFAULT 'linear',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_prediction_device ON risk_predictions(device_name);
+        CREATE INDEX IF NOT EXISTS idx_prediction_date ON risk_predictions(prediction_date);
         """)

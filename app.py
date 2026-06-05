@@ -47,6 +47,13 @@ from review_module import (
     export_review_comments,
     REVIEWER_ROLES, ANNOTATION_TYPES, ANNOTATION_PRIORITIES, ANNOTATION_STATUSES,
 )
+from risk_assessment import (
+    calculate_all_risk_scores, load_risk_scores,
+    get_risk_score_history, get_risk_score_detail,
+    get_risk_level_counts, get_upgrade_alerts,
+    generate_comparison_summary,
+    RISK_LEVELS, get_risk_level, get_risk_level_info,
+)
 
 st.set_page_config(page_title="医疗器械不良事件信号检测平台", layout="wide", page_icon="🔬")
 
@@ -67,6 +74,14 @@ if "review_page_tab" not in st.session_state:
     st.session_state.review_page_tab = "报告审阅看板"
 if "current_reviewer" not in st.session_state:
     st.session_state.current_reviewer = None
+if "risk_scores_df" not in st.session_state:
+    st.session_state.risk_scores_df = pd.DataFrame()
+if "selected_risk_device" not in st.session_state:
+    st.session_state.selected_risk_device = None
+if "risk_compare_devices" not in st.session_state:
+    st.session_state.risk_compare_devices = []
+if "risk_page_tab" not in st.session_state:
+    st.session_state.risk_page_tab = "风险排行看板"
 
 if st.session_state.selected_report_for_detail is not None:
     default_page = "📝 报告审阅"
@@ -85,6 +100,7 @@ page_options = [
     "👥 亚组分析",
     "🔄 同类对比",
     "📋 信号看板",
+    "📊 风险评分",
     "⚙️ 检测参数配置",
     "📄 报告导出",
     "📝 报告审阅",
@@ -307,7 +323,11 @@ def page_detection():
                     detect_changes(detection_run_id, result_df)
                     generate_alerts(result_df, detection_run_id)
 
-                st.success("信号检测完成！")
+                    with st.spinner("正在计算风险评分..."):
+                        calculate_all_risk_scores(detection_run_id)
+                        st.session_state.risk_scores_df = load_risk_scores()
+
+                st.success("信号检测完成！风险评分已更新。")
                 st.rerun()
 
     with col1:
@@ -855,6 +875,482 @@ def page_kanban():
 
     st.divider()
     st.caption("💡 使用提示：点击卡片右侧的快捷按钮可快速变更状态，无需额外确认。看板已自动过滤'无信号'的条目。")
+
+
+def page_risk_assessment():
+    st.title("📊 风险评分与预测")
+
+    if st.session_state.risk_scores_df.empty:
+        st.session_state.risk_scores_df = load_risk_scores()
+
+    rdf = st.session_state.risk_scores_df
+
+    if rdf.empty:
+        st.info("尚未计算风险评分，请先运行信号检测。")
+        if st.button("🔄 运行风险评分计算", type="primary"):
+            with st.spinner("正在计算风险评分..."):
+                calculate_all_risk_scores()
+                st.session_state.risk_scores_df = load_risk_scores()
+                st.rerun()
+        return
+
+    upgrade_alerts = get_upgrade_alerts()
+    if upgrade_alerts:
+        st.error("⚠️ **预警升级提示**")
+        for alert in upgrade_alerts:
+            pred_values = alert.get("prediction_values", [])
+            next_pred = pred_values[0] if pred_values else None
+            with st.container(border=True):
+                col_a, col_b, col_c = st.columns([3, 2, 1])
+                with col_a:
+                    st.markdown(f"**{alert['device_name']}**")
+                    st.caption(f"当前: {alert['risk_level']} ({alert['total_score']:.0f}分) → 预测: {next_pred['predicted_level'] if next_pred else 'N/A'} ({next_pred['predicted_score']:.0f}分)")
+                with col_b:
+                    st.markdown(f"<span style='color:#ff7f0e;font-weight:bold;font-size:18px;'>⬆️ 即将升级</span>", unsafe_allow_html=True)
+                with col_c:
+                    if st.button("查看详情", key=f"alert_{alert['device_name']}"):
+                        st.session_state.selected_risk_device = alert["device_name"]
+                        st.session_state.risk_page_tab = "风险排行看板"
+                        st.rerun()
+
+    tab1, tab2 = st.tabs(["📋 风险排行看板", "📈 风险对比分析"])
+    st.session_state.risk_page_tab = "风险排行看板" if tab1 else "风险对比分析"
+
+    with tab1:
+        st.session_state.risk_page_tab = "风险排行看板"
+        _display_risk_dashboard(rdf)
+
+    with tab2:
+        st.session_state.risk_page_tab = "风险对比分析"
+        _display_risk_comparison(rdf)
+
+
+def _display_risk_dashboard(rdf):
+    st.subheader("📊 风险等级分布")
+
+    level_counts = get_risk_level_counts()
+
+    gauge_col1, gauge_col2, gauge_col3, gauge_col4, gauge_col5 = st.columns(5)
+    gauge_cols = [gauge_col1, gauge_col2, gauge_col3, gauge_col4, gauge_col5]
+
+    for i, (lower, upper, name, color, short) in enumerate(RISK_LEVELS):
+        count = level_counts.get(name, 0)
+        with gauge_cols[i]:
+            fig = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=count,
+                domain={'x': [0, 1], 'y': [0, 1]},
+                title={'text': name, 'font': {'size': 14, 'color': color}},
+                gauge={
+                    'axis': {'range': [0, max(level_counts.values()) + 5 if level_counts else 10], 'visible': False},
+                    'bar': {'color': color},
+                    'steps': [
+                        {'range': [0, max(level_counts.values()) + 5 if level_counts else 10], 'color': '#f0f0f0'}
+                    ],
+                    'threshold': {
+                        'line': {'color': color, 'width': 4},
+                        'thickness': 0.75,
+                        'value': count
+                    }
+                },
+                number={'font': {'size': 36, 'color': color}}
+            ))
+            fig.update_layout(height=220, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    col_filter, col_refresh = st.columns([3, 1])
+    with col_filter:
+        level_filter = st.multiselect(
+            "筛选风险等级",
+            [name for _, _, name, _, _ in RISK_LEVELS],
+            default=[]
+        )
+    with col_refresh:
+        st.write("")
+        st.write("")
+        if st.button("🔄 重新计算", type="secondary", use_container_width=True):
+            with st.spinner("正在重新计算风险评分..."):
+                calculate_all_risk_scores()
+                st.session_state.risk_scores_df = load_risk_scores()
+                st.rerun()
+
+    display_df = rdf.copy()
+    if level_filter:
+        display_df = display_df[display_df["risk_level"].isin(level_filter)]
+
+    st.subheader(f"器械风险排行（共 {len(display_df)} 个器械）")
+
+    for _, row in display_df.iterrows():
+        device_name = row["device_name"]
+        risk_level = row["risk_level"]
+        total_score = row["total_score"]
+        level_info = get_risk_level_info(risk_level)
+        color = level_info["color"]
+
+        is_expanded = st.session_state.selected_risk_device == device_name
+
+        with st.expander(f"**{device_name}**", expanded=is_expanded):
+            col_main, col_actions = st.columns([5, 1])
+
+            with col_main:
+                col1, col2, col3, col4, col5 = st.columns([2, 1, 2, 2, 1])
+                with col1:
+                    st.markdown(f"### {device_name}")
+                    st.markdown(
+                        f"<span style='background-color:{color};color:white;padding:4px 12px;border-radius:12px;font-weight:bold;'>{risk_level}</span>",
+                        unsafe_allow_html=True
+                    )
+                with col2:
+                    st.metric("综合评分", f"{total_score:.0f}分")
+                with col3:
+                    history = get_risk_score_history(device_name, limit=5)
+                    if len(history) >= 2:
+                        hist_scores = [h["total_score"] for h in history]
+                        fig_mini = go.Figure()
+                        fig_mini.add_trace(go.Scatter(
+                            x=list(range(len(hist_scores))),
+                            y=hist_scores,
+                            mode="lines+markers",
+                            line=dict(color=color, width=2),
+                            marker=dict(size=6, color=color),
+                        ))
+                        fig_mini.update_layout(
+                            height=60,
+                            margin=dict(l=0, r=0, t=0, b=0),
+                            xaxis=dict(visible=False),
+                            yaxis=dict(visible=False, range=[0, 100]),
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            paper_bgcolor='rgba(0,0,0,0)',
+                        )
+                        st.plotly_chart(fig_mini, use_container_width=True, key=f"mini_{device_name}")
+                    else:
+                        st.caption("历史数据不足")
+                with col4:
+                    trend_icon = {"升": "📈 上升", "降": "📉 下降", "稳": "➡️ 平稳"}
+                    trend = row.get("prediction_trend", "稳")
+                    st.markdown(f"**预测走势**: {trend_icon.get(trend, trend)}")
+
+                    signal_score = row.get("signal_strength_score", 0)
+                    signal_label = {100: "强信号", 60: "中等信号", 30: "弱信号", 0: "无信号"}
+                    st.markdown(f"**最高信号强度**: {signal_label.get(int(signal_score), '无信号')}")
+                with col5:
+                    if row.get("is_upgrade_alert"):
+                        st.markdown(
+                            "<div style='background-color:#fff3cd;padding:8px;border-radius:8px;text-align:center;'>"
+                            "<span style='color:#d62728;font-weight:bold;'>⚠️ 预警升级</span></div>",
+                            unsafe_allow_html=True
+                        )
+
+            with col_actions:
+                if st.button("查看详情", key=f"detail_{device_name}", use_container_width=True, type="primary"):
+                    if st.session_state.selected_risk_device == device_name:
+                        st.session_state.selected_risk_device = None
+                    else:
+                        st.session_state.selected_risk_device = device_name
+                    st.rerun()
+
+            if st.session_state.selected_risk_device == device_name:
+                st.divider()
+                _display_risk_detail(device_name, row)
+
+
+def _display_risk_detail(device_name, row):
+    st.markdown(f"### 📊 {device_name} - 风险评分详情")
+
+    detail = get_risk_score_detail(device_name)
+    history = get_risk_score_history(device_name, limit=10)
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("因子得分明细")
+
+        factors = [
+            ("信号强度因子", row.get("signal_strength_score", 0), row.get("signal_strength_factor", 0), 0.40, "#1f77b4"),
+            ("报告频率因子", row.get("report_frequency_score", 0), row.get("report_frequency_factor", 0), 0.25, "#ff7f0e"),
+            ("严重程度因子", row.get("severity_score", 0), row.get("severity_factor", 0), 0.20, "#2ca02c"),
+            ("趋势因子", row.get("trend_score", 0), row.get("trend_factor", 0), 0.15, "#d62728"),
+        ]
+
+        for name, raw, weighted, weight, color in factors:
+            with st.container(border=True):
+                col_f1, col_f2, col_f3 = st.columns([2, 2, 3])
+                with col_f1:
+                    st.markdown(f"**{name}**")
+                    st.caption(f"权重: {int(weight * 100)}%")
+                with col_f2:
+                    st.metric("原始得分", f"{raw:.0f}/100")
+                with col_f3:
+                    st.metric("加权得分", f"{weighted:.1f}分")
+                    fig_bar = go.Figure(go.Bar(
+                        x=[weighted],
+                        y=[""],
+                        orientation='h',
+                        marker=dict(color=color),
+                        text=[f"{weighted:.1f}"],
+                        textposition='auto',
+                    ))
+                    fig_bar.update_layout(
+                        height=30,
+                        margin=dict(l=0, r=0, t=0, b=0),
+                        xaxis=dict(range=[0, weight * 100], visible=False),
+                        yaxis=dict(visible=False),
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig_bar, use_container_width=True, key=f"bar_{device_name}_{name}")
+
+        st.divider()
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            st.metric("加权总分", f"{row['total_score']:.1f}分")
+        with col_b2:
+            st.metric("贝叶斯风险", f"{row.get('bayesian_risk', 0):.1f}分")
+
+    with col2:
+        st.subheader("历史评分变化")
+
+        if history and len(history) >= 2:
+            hist_df = pd.DataFrame(history)
+            hist_df["created_at"] = pd.to_datetime(hist_df["created_at"])
+            hist_df["date_str"] = hist_df["created_at"].dt.strftime("%Y-%m-%d %H:%M")
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=hist_df["date_str"],
+                y=hist_df["total_score"],
+                mode="lines+markers",
+                name="历史评分",
+                line=dict(color="#1f77b4", width=3),
+                marker=dict(size=10, color="#1f77b4"),
+            ))
+
+            predictions = row.get("prediction_values", [])
+            if predictions:
+                pred_dates = []
+                pred_scores = []
+                for i, pred in enumerate(predictions):
+                    from datetime import datetime, timedelta
+                    pred_date = (datetime.now() + timedelta(days=30 * (i + 1))).strftime("%Y-%m-%d")
+                    pred_dates.append(f"预测+{i+1}月 ({pred_date})")
+                    pred_scores.append(pred["predicted_score"])
+
+                if len(hist_df) > 0:
+                    pred_x = [hist_df["date_str"].iloc[-1]] + pred_dates
+                    pred_y = [hist_df["total_score"].iloc[-1]] + pred_scores
+
+                    fig.add_trace(go.Scatter(
+                        x=pred_x,
+                        y=pred_y,
+                        mode="lines+markers",
+                        name="预测走势",
+                        line=dict(color="#d62728", width=3, dash="dash"),
+                        marker=dict(size=10, color="#d62728", symbol="diamond"),
+                    ))
+
+            risk_level_colors = {
+                "极高风险": "#d62728",
+                "高风险": "#ff7f0e",
+                "中等风险": "#feca57",
+                "低风险": "#2ca02c",
+                "极低风险": "#7f7f7f",
+            }
+            for _, _, name, color, _ in RISK_LEVELS:
+                fig.add_hline(
+                    y=_get_level_midpoint(name),
+                    line_dash="dash",
+                    line_color=color,
+                    opacity=0.3,
+                    annotation_text=name,
+                    annotation_position="right",
+                )
+
+            fig.update_layout(
+                title=f"{device_name} 风险评分趋势",
+                xaxis_title="时间",
+                yaxis_title="风险评分",
+                yaxis=dict(range=[0, 100]),
+                height=400,
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig, use_container_width=True, key=f"history_{device_name}")
+        else:
+            st.info("历史数据不足（至少需要3个数据点）")
+
+        predictions = row.get("prediction_values", [])
+        if predictions:
+            st.subheader("未来3个月预测")
+            pred_cols = st.columns(3)
+            for i, pred in enumerate(predictions):
+                with pred_cols[i]:
+                    pred_level = pred["predicted_level"]
+                    pred_color = get_risk_level_info(pred_level)["color"]
+                    st.metric(
+                        f"+{i+1}个月",
+                        f"{pred['predicted_score']:.0f}分",
+                        delta=None,
+                    )
+                    st.markdown(
+                        f"<div style='text-align:center;background-color:{pred_color};color:white;padding:4px 8px;border-radius:8px;'>{pred_level}</div>",
+                        unsafe_allow_html=True
+                    )
+
+
+def _get_level_midpoint(level_name):
+    level_ranges = {
+        "极高风险": 90,
+        "高风险": 70,
+        "中等风险": 50,
+        "低风险": 30,
+        "极低风险": 10,
+    }
+    return level_ranges.get(level_name, 0)
+
+
+def _display_risk_comparison(rdf):
+    st.subheader("📈 器械风险对比分析")
+
+    all_devices = rdf["device_name"].tolist()
+    selected = st.multiselect(
+        "选择要对比的器械（2-5个）",
+        all_devices,
+        default=st.session_state.risk_compare_devices,
+    )
+    st.session_state.risk_compare_devices = selected
+
+    if len(selected) < 2:
+        st.warning("请至少选择2个器械进行对比")
+        return
+    if len(selected) > 5:
+        st.warning("最多只能选择5个器械进行对比")
+        return
+
+    devices_data = []
+    for device in selected:
+        detail = get_risk_score_detail(device)
+        if detail:
+            devices_data.append(detail)
+
+    if not devices_data:
+        st.warning("未找到选中器械的风险数据")
+        return
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("🎯 因子维度对比（雷达图）")
+
+        categories = ["信号强度", "报告频率", "严重程度", "趋势"]
+        fig_radar = go.Figure()
+
+        colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+
+        for i, data in enumerate(devices_data):
+            values = [
+                data.get("signal_strength_score", 0),
+                data.get("report_frequency_score", 0),
+                data.get("severity_score", 0),
+                data.get("trend_score", 0),
+            ]
+            fig_radar.add_trace(go.Scatterpolar(
+                r=values,
+                theta=categories,
+                fill='toself',
+                name=data["device_name"],
+                line=dict(color=colors[i % len(colors)]),
+                marker=dict(color=colors[i % len(colors)]),
+                opacity=0.6,
+            ))
+
+        fig_radar.update_layout(
+            polar=dict(
+                radialaxis=dict(
+                    visible=True,
+                    range=[0, 100]
+                )),
+            showlegend=True,
+            height=500,
+        )
+        st.plotly_chart(fig_radar, use_container_width=True)
+
+    with col2:
+        st.subheader("📈 历史评分走势对比")
+
+        fig_line = go.Figure()
+
+        for i, data in enumerate(devices_data):
+            history = get_risk_score_history(data["device_name"], limit=10)
+            if history:
+                hist_df = pd.DataFrame(history)
+                hist_df["created_at"] = pd.to_datetime(hist_df["created_at"])
+                hist_df["date_str"] = hist_df["created_at"].dt.strftime("%m-%d")
+
+                fig_line.add_trace(go.Scatter(
+                    x=hist_df["date_str"],
+                    y=hist_df["total_score"],
+                    mode="lines+markers",
+                    name=data["device_name"],
+                    line=dict(color=colors[i % len(colors)], width=2),
+                    marker=dict(size=8, color=colors[i % len(colors)]),
+                ))
+
+        for _, _, name, color, _ in RISK_LEVELS:
+            fig_line.add_hline(
+                y=_get_level_midpoint(name),
+                line_dash="dash",
+                line_color=color,
+                opacity=0.3,
+            )
+
+        fig_line.update_layout(
+            xaxis_title="时间",
+            yaxis_title="风险评分",
+            yaxis=dict(range=[0, 100]),
+            height=500,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig_line, use_container_width=True)
+
+    st.divider()
+
+    st.subheader("📋 综合评分对比")
+    summary_data = []
+    for data in devices_data:
+        level_info = get_risk_level_info(data["risk_level"])
+        summary_data.append({
+            "器械名称": data["device_name"],
+            "综合评分": f"{data['total_score']:.1f}",
+            "风险等级": data["risk_level"],
+            "信号强度": f"{data.get('signal_strength_score', 0):.0f}",
+            "报告频率": f"{data.get('report_frequency_score', 0):.0f}",
+            "严重程度": f"{data.get('severity_score', 0):.0f}",
+            "趋势": f"{data.get('trend_score', 0):.0f}",
+            "贝叶斯风险": f"{data.get('bayesian_risk', 0):.1f}",
+            "预测走势": {"升": "📈 上升", "降": "📉 下降", "稳": "➡️ 平稳"}.get(data.get("prediction_trend", "稳"), "稳"),
+        })
+
+    summary_df = pd.DataFrame(summary_data)
+
+    def highlight_level(val):
+        level_info = get_risk_level_info(val)
+        color = level_info["color"]
+        return f'background-color: {color}; color: white; font-weight: bold; text-align: center;'
+
+    styled_df = summary_df.style.applymap(highlight_level, subset=["风险等级"])
+    st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    st.subheader("💡 对比分析总结")
+    summary_text = generate_comparison_summary(devices_data)
+    if summary_text:
+        st.info(summary_text)
+    else:
+        st.info("暂无对比数据")
 
 
 def page_config():
@@ -2149,6 +2645,8 @@ elif page == "🔄 同类对比":
     page_similar()
 elif page == "📋 信号看板":
     page_kanban()
+elif page == "📊 风险评分":
+    page_risk_assessment()
 elif page == "⚙️ 检测参数配置":
     page_config()
 elif page == "📄 报告导出":
