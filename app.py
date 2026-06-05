@@ -5,6 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import os
 import tempfile
+from datetime import datetime
 
 from db import init_db, get_db
 from data_import import (
@@ -22,15 +23,29 @@ from workflow import (
     get_kanban_data, get_signal_with_workflow,
 )
 from report_export import generate_pdf_report
+from config_manager import (
+    get_active_config, get_all_configs, save_new_config,
+    reset_to_default, DEFAULT_CONFIG, init_default_config,
+)
+from alert_manager import generate_alerts, get_recent_alerts, get_all_alerts
+from signal_tracker import (
+    create_detection_run, save_signal_history, detect_changes,
+    get_changes_for_run, get_latest_changes, get_last_detection_run,
+)
 
 st.set_page_config(page_title="医疗器械不良事件信号检测平台", layout="wide", page_icon="🔬")
 
 init_db()
+init_default_config()
 
 if "signals_df" not in st.session_state:
     st.session_state.signals_df = load_signals()
 if "correction_method" not in st.session_state:
     st.session_state.correction_method = "fdr"
+if "detection_page_tab" not in st.session_state:
+    st.session_state.detection_page_tab = "检测结果"
+if "selected_signal_for_detail" not in st.session_state:
+    st.session_state.selected_signal_for_detail = None
 
 page = st.sidebar.selectbox("导航", [
     "🏠 数据概览",
@@ -42,6 +57,7 @@ page = st.sidebar.selectbox("导航", [
     "👥 亚组分析",
     "🔄 同类对比",
     "📋 信号看板",
+    "⚙️ 检测参数配置",
     "📄 报告导出",
 ])
 
@@ -70,6 +86,50 @@ def page_overview():
             st.metric("弱信号", len(sdf[sdf["signal_strength"] == "弱信号"]))
         with col4:
             st.metric("无信号", len(sdf[sdf["signal_strength"] == "无信号"]))
+
+    st.divider()
+    st.subheader("⚠️ 最新预警（最近7天）")
+    recent_alerts = get_recent_alerts(days=7)
+    if not recent_alerts:
+        st.info("最近7天内没有新的预警记录")
+    else:
+        alert_df = pd.DataFrame(recent_alerts)
+        alert_df_display = alert_df[["created_at", "device_name", "event_type", "signal_strength", "prr_value", "report_count", "signal_id"]].copy()
+        alert_df_display.columns = ["预警时间", "器械名称", "事件类型", "信号强度", "PRR值", "报告数量", "信号ID"]
+        alert_df_display["预警时间"] = pd.to_datetime(alert_df_display["预警时间"]).dt.strftime("%Y-%m-%d %H:%M")
+        alert_df_display["PRR值"] = alert_df_display["PRR值"].apply(lambda x: f"{x:.3f}" if pd.notna(x) else "N/A")
+
+        def format_signal_strength(s):
+            if s == "强信号":
+                return f"<span style='color:#d62728;font-weight:bold;background-color:#ffe6e6;padding:2px 8px;border-radius:4px;'>🔴 {s}</span>"
+            else:
+                return f"<span style='color:#ff7f0e;font-weight:bold;background-color:#fff3e6;padding:2px 8px;border-radius:4px;'>🟠 {s}</span>"
+
+        alert_df_display["信号强度"] = alert_df_display["信号强度"].apply(format_signal_strength)
+
+        for idx, row in alert_df_display.iterrows():
+            with st.container(border=True):
+                col_a, col_b, col_c, col_d = st.columns([3, 2, 1, 1])
+                with col_a:
+                    st.markdown(f"**{row['器械名称']}** - {row['事件类型']}")
+                    st.caption(f"🕐 {row['预警时间']}")
+                with col_b:
+                    st.markdown(row["信号强度"], unsafe_allow_html=True)
+                with col_c:
+                    st.metric("PRR", row["PRR值"])
+                with col_d:
+                    st.metric("报告数", row["报告数量"])
+                if pd.notna(row["信号ID"]):
+                    if st.button(f"查看详细分析 →", key=f"alert_detail_{idx}", use_container_width=True):
+                        st.session_state.selected_signal_for_detail = {
+                            "device_name": row["器械名称"],
+                            "event_type": row["事件类型"],
+                            "signal_id": int(row["信号ID"]),
+                        }
+                        st.session_state.detection_page_tab = "检测结果"
+                        st.rerun()
+
+    st.divider()
 
     df = load_reports()
     if not df.empty:
@@ -193,12 +253,23 @@ def page_detection():
                 if df.empty:
                     st.error("没有数据，请先导入报告数据")
                     return
-                result_df = run_signal_detection(df)
+
+                active_config = get_active_config()
+                config_id = active_config.get("id")
+
+                result_df = run_signal_detection(df, config=active_config)
                 if not result_df.empty:
                     result_df = apply_corrections(result_df)
                     save_signals(result_df)
                     st.session_state.signals_df = result_df
                     init_workflow_for_signals()
+
+                    total_reports = len(df)
+                    detection_run_id = create_detection_run(total_reports, result_df, config_id)
+                    save_signal_history(detection_run_id, result_df)
+                    detect_changes(detection_run_id, result_df)
+                    generate_alerts(result_df, detection_run_id)
+
                 st.success("信号检测完成！")
                 st.rerun()
 
@@ -208,49 +279,106 @@ def page_detection():
             st.info("尚未运行信号检测，请点击右侧按钮运行")
             return
 
-        correction_label = {"fdr": "FDR校正后", "bonferroni": "Bonferroni校正后", "none": "校正前"}
-        show_corrected = correction_method != "none"
+        tab1, tab2 = st.tabs(["📊 检测结果", "🔄 信号变化"])
+        st.session_state.detection_page_tab = "检测结果" if tab1 else "信号变化"
 
-        if show_corrected:
-            sdf_display = sdf.copy()
-            sdf_display["校正后信号强度"] = sdf_display.apply(
-                lambda row: get_corrected_signal_strength(row, correction_method), axis=1
-            )
-        else:
-            sdf_display = sdf.copy()
-            sdf_display["校正后信号强度"] = sdf_display["signal_strength"]
+        with tab1:
+            correction_label = {"fdr": "FDR校正后", "bonferroni": "Bonferroni校正后", "none": "校正前"}
+            show_corrected = correction_method != "none"
 
-        st.subheader(f"检测结果（{correction_label.get(correction_method, '')}）")
-        strength_filter = st.multiselect("筛选信号强度", ["强信号", "中等信号", "弱信号", "无信号"],
-                                          default=["强信号", "中等信号", "弱信号"])
-        filtered = sdf_display[sdf_display["校正后信号强度"].isin(strength_filter)]
-        filtered = filtered.sort_values("signal_count", ascending=False)
+            if show_corrected:
+                sdf_display = sdf.copy()
+                sdf_display["校正后信号强度"] = sdf_display.apply(
+                    lambda row: get_corrected_signal_strength(row, correction_method), axis=1
+                )
+            else:
+                sdf_display = sdf.copy()
+                sdf_display["校正后信号强度"] = sdf_display["signal_strength"]
 
-        display_cols = ["device_name", "event_type", "report_count", "prr_value", "ror_value",
-                        "ic_value", "ebgm_value", "signal_strength", "校正后信号强度"]
-        if "bonferroni_signal" in filtered.columns:
-            display_cols += ["bonferroni_signal", "fdr_signal"]
-        existing = [c for c in display_cols if c in filtered.columns]
-        st.dataframe(filtered[existing], use_container_width=True)
+            st.subheader(f"检测结果（{correction_label.get(correction_method, '')}）")
+            strength_filter = st.multiselect("筛选信号强度", ["强信号", "中等信号", "弱信号", "无信号"],
+                                              default=["强信号", "中等信号", "弱信号"])
+            filtered = sdf_display[sdf_display["校正后信号强度"].isin(strength_filter)]
+            filtered = filtered.sort_values("signal_count", ascending=False)
 
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            strength_counts = sdf_display["校正后信号强度"].value_counts()
-            fig = px.pie(values=strength_counts.values, names=strength_counts.index, title="信号强度分布", hole=0.4)
-            st.plotly_chart(fig, use_container_width=True)
-        with col_b:
-            top_signals = sdf_display[sdf_display["校正后信号强度"] != "无信号"].nlargest(10, "signal_count")
-            if not top_signals.empty:
-                fig2 = px.bar(top_signals, x="device_name", y="report_count", color="event_type",
-                              title="Top10信号报告数")
-                fig2.update_layout(xaxis_tickangle=-45)
-                st.plotly_chart(fig2, use_container_width=True)
-        with col_c:
-            if "p_value" in sdf.columns:
-                fig3 = go.Figure()
-                fig3.add_trace(go.Histogram(x=sdf["p_value"].dropna(), nbinsx=30, name="p-value"))
-                fig3.update_layout(title="P值分布", xaxis_title="p-value", yaxis_title="Count")
-                st.plotly_chart(fig3, use_container_width=True)
+            display_cols = ["device_name", "event_type", "report_count", "prr_value", "ror_value",
+                            "ic_value", "ebgm_value", "signal_strength", "校正后信号强度"]
+            if "bonferroni_signal" in filtered.columns:
+                display_cols += ["bonferroni_signal", "fdr_signal"]
+            existing = [c for c in display_cols if c in filtered.columns]
+            st.dataframe(filtered[existing], use_container_width=True)
+
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                strength_counts = sdf_display["校正后信号强度"].value_counts()
+                fig = px.pie(values=strength_counts.values, names=strength_counts.index, title="信号强度分布", hole=0.4)
+                st.plotly_chart(fig, use_container_width=True)
+            with col_b:
+                top_signals = sdf_display[sdf_display["校正后信号强度"] != "无信号"].nlargest(10, "signal_count")
+                if not top_signals.empty:
+                    fig2 = px.bar(top_signals, x="device_name", y="report_count", color="event_type",
+                                  title="Top10信号报告数")
+                    fig2.update_layout(xaxis_tickangle=-45)
+                    st.plotly_chart(fig2, use_container_width=True)
+            with col_c:
+                if "p_value" in sdf.columns:
+                    fig3 = go.Figure()
+                    fig3.add_trace(go.Histogram(x=sdf["p_value"].dropna(), nbinsx=30, name="p-value"))
+                    fig3.update_layout(title="P值分布", xaxis_title="p-value", yaxis_title="Count")
+                    st.plotly_chart(fig3, use_container_width=True)
+
+        with tab2:
+            st.session_state.detection_page_tab = "信号变化"
+            st.subheader("🔄 信号变化对比")
+            last_run = get_last_detection_run()
+            if not last_run:
+                st.info("尚未运行过信号检测，无法对比变化")
+            else:
+                changes = get_changes_for_run(last_run["id"])
+                if not changes:
+                    st.info("本次检测与上一次检测相比，没有信号强度变化")
+                    st.caption(f"检测运行时间: {last_run['run_time']}")
+                else:
+                    st.caption(f"对比时间: {last_run['run_time']} | 共 {len(changes)} 个变化")
+                    change_df = pd.DataFrame(changes)
+
+                    def format_change_icon(change_type):
+                        if change_type == "升级":
+                            return f"<span style='color:#d62728;font-size:20px;'>⬆️</span> <span style='color:#d62728;font-weight:bold;'>升级</span>"
+                        elif change_type == "降级":
+                            return f"<span style='color:#2ca02c;font-size:20px;'>⬇️</span> <span style='color:#2ca02c;font-weight:bold;'>降级</span>"
+                        elif change_type == "新增":
+                            return f"<span style='color:#1f77b4;font-size:20px;'>➕</span> <span style='color:#1f77b4;font-weight:bold;'>新增</span>"
+                        else:
+                            return f"<span style='color:#7f7f7f;font-size:20px;'>➖</span> <span style='color:#7f7f7f;font-weight:bold;'>消失</span>"
+
+                    def format_strength(s):
+                        color = {"强信号": "#d62728", "中等信号": "#ff7f0e", "弱信号": "#2ca02c", "无信号": "#7f7f7f"}
+                        c = color.get(s, "#7f7f7f")
+                        return f"<span style='color:{c};font-weight:bold;'>{s}</span>"
+
+                    for idx, row in change_df.iterrows():
+                        with st.container(border=True):
+                            col_a, col_b, col_c, col_d = st.columns([2, 1, 1, 2])
+                            with col_a:
+                                st.markdown(f"**{row['device_name']}** - {row['event_type']}")
+                            with col_b:
+                                st.markdown(format_change_icon(row['change_type']), unsafe_allow_html=True)
+                            with col_c:
+                                st.markdown(
+                                    f"{format_strength(row['previous_strength'])} → {format_strength(row['current_strength'])}",
+                                    unsafe_allow_html=True
+                                )
+                            with col_d:
+                                st.caption(f"历史: {row['previous_strength']} | 本次: {row['current_strength']}")
+                                if pd.notna(row.get("signal_id")):
+                                    if st.button(f"查看详情", key=f"change_detail_{idx}", use_container_width=True):
+                                        st.session_state.selected_signal_for_detail = {
+                                            "device_name": row["device_name"],
+                                            "event_type": row["event_type"],
+                                            "signal_id": int(row["signal_id"]),
+                                        }
+                                        st.rerun()
 
 
 def page_matrix():
@@ -623,6 +751,166 @@ def page_kanban():
     st.caption("💡 使用提示：点击卡片右侧的快捷按钮可快速变更状态，无需额外确认。看板已自动过滤'无信号'的条目。")
 
 
+def page_config():
+    st.title("⚙️ 检测参数配置")
+
+    active_config = get_active_config()
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.subheader("自定义检测阈值")
+        st.info("修改以下参数后点击'保存配置'按钮，新配置将在下次信号检测时生效。")
+
+        with st.form("config_form"):
+            st.markdown("#### PRR算法参数")
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                prr_threshold = st.number_input(
+                    "PRR阈值",
+                    min_value=1.0,
+                    max_value=10.0,
+                    value=float(active_config.get("prr_threshold", 2.0)),
+                    step=0.1,
+                    help="PRR >= 该值则判定为信号"
+                )
+            with col_b:
+                min_report_count = st.number_input(
+                    "最小报告数",
+                    min_value=1,
+                    max_value=50,
+                    value=int(active_config.get("min_report_count", 3)),
+                    step=1,
+                    help="报告数 >= 该值才考虑为信号"
+                )
+            with col_c:
+                p_value_threshold = st.number_input(
+                    "卡方检验p值阈值",
+                    min_value=0.001,
+                    max_value=0.1,
+                    value=float(active_config.get("p_value_threshold", 0.05)),
+                    step=0.001,
+                    format="%.3f",
+                    help="p值 < 该值则判定为显著"
+                )
+
+            st.divider()
+            st.markdown("#### 其他算法参数")
+            col_d, col_e, col_f = st.columns(3)
+            with col_d:
+                ror_lower_threshold = st.number_input(
+                    "ROR下限阈值",
+                    min_value=0.5,
+                    max_value=5.0,
+                    value=float(active_config.get("ror_lower_threshold", 1.0)),
+                    step=0.1,
+                    help="ROR置信区间下限 > 该值则判定为信号"
+                )
+            with col_e:
+                ic025_threshold = st.number_input(
+                    "IC025阈值",
+                    min_value=-2.0,
+                    max_value=5.0,
+                    value=float(active_config.get("ic025_threshold", 0.0)),
+                    step=0.1,
+                    help="IC025 > 该值则判定为信号"
+                )
+            with col_f:
+                eb05_threshold = st.number_input(
+                    "EB05阈值",
+                    min_value=0.5,
+                    max_value=10.0,
+                    value=float(active_config.get("eb05_threshold", 2.0)),
+                    step=0.1,
+                    help="EB05 >= 该值则判定为信号"
+                )
+
+            st.divider()
+            st.markdown("#### 加权投票参数")
+            strong_signal_min_methods = st.number_input(
+                "强信号所需最少阳性方法数",
+                min_value=2,
+                max_value=4,
+                value=int(active_config.get("strong_signal_min_methods", 3)),
+                step=1,
+                help="4种方法中至少有多少种判定为阳性才算强信号"
+            )
+
+            st.divider()
+            col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
+            with col_btn1:
+                submitted = st.form_submit_button("💾 保存配置", type="primary", use_container_width=True)
+            with col_btn2:
+                reset = st.form_submit_button("🔄 恢复默认值", use_container_width=True)
+            with col_btn3:
+                operator = st.text_input("操作人", value="分析员")
+
+            if submitted:
+                new_config = {
+                    "prr_threshold": prr_threshold,
+                    "min_report_count": min_report_count,
+                    "p_value_threshold": p_value_threshold,
+                    "ror_lower_threshold": ror_lower_threshold,
+                    "ic025_threshold": ic025_threshold,
+                    "eb05_threshold": eb05_threshold,
+                    "strong_signal_min_methods": strong_signal_min_methods,
+                }
+                save_new_config(new_config, created_by=operator)
+                st.success("配置已保存！下次信号检测将使用新参数。")
+                st.rerun()
+
+            if reset:
+                reset_to_default()
+                st.success("已恢复为默认配置！")
+                st.rerun()
+
+    with col2:
+        st.subheader("当前配置对比")
+        current = get_active_config()
+        comparison_data = []
+        param_labels = {
+            "prr_threshold": "PRR阈值",
+            "min_report_count": "最小报告数",
+            "p_value_threshold": "p值阈值",
+            "ror_lower_threshold": "ROR下限阈值",
+            "ic025_threshold": "IC025阈值",
+            "eb05_threshold": "EB05阈值",
+            "strong_signal_min_methods": "强信号最少方法数",
+        }
+
+        for key, label in param_labels.items():
+            default_val = DEFAULT_CONFIG.get(key, "-")
+            current_val = current.get(key, "-")
+            is_changed = default_val != current_val
+            comparison_data.append({
+                "参数": label,
+                "默认值": default_val,
+                "当前值": current_val,
+                "状态": "✅ 已修改" if is_changed else "⚪ 默认值"
+            })
+
+        comparison_df = pd.DataFrame(comparison_data)
+        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("历史配置记录")
+        all_configs = get_all_configs()
+        if all_configs:
+            history_data = []
+            for cfg in all_configs[:10]:
+                history_data.append({
+                    "ID": cfg["id"],
+                    "创建时间": cfg["created_at"],
+                    "创建人": cfg.get("created_by", "系统"),
+                    "PRR阈值": cfg["prr_threshold"],
+                    "最小报告数": cfg["min_report_count"],
+                    "状态": "✅ 生效中" if cfg["is_active"] == 1 else "⚪ 已过期"
+                })
+            history_df = pd.DataFrame(history_data)
+            st.dataframe(history_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无历史配置记录")
+
+
 def page_export():
     st.title("📄 报告导出")
 
@@ -678,5 +966,7 @@ elif page == "🔄 同类对比":
     page_similar()
 elif page == "📋 信号看板":
     page_kanban()
+elif page == "⚙️ 检测参数配置":
+    page_config()
 elif page == "📄 报告导出":
     page_export()

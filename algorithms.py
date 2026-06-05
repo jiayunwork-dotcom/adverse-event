@@ -3,6 +3,7 @@ import pandas as pd
 from scipy import stats
 from scipy.special import gammaln, digamma, polygamma
 from db import get_db
+from config_manager import get_active_config
 
 
 def build_contingency_table(df, device_name, event_type):
@@ -13,11 +14,18 @@ def build_contingency_table(df, device_name, event_type):
     return a, b, c, d
 
 
-def compute_prr(a, b, c, d):
+def compute_prr(a, b, c, d, config=None):
+    if config is None:
+        config = get_active_config()
+
+    prr_threshold = config.get("prr_threshold", 2.0)
+    min_report_count = config.get("min_report_count", 3)
+    p_value_threshold = config.get("p_value_threshold", 0.05)
+
     n1 = a + b
     n2 = c + d
     if a == 0 or c == 0 or n1 == 0 or n2 == 0:
-        return np.nan, np.nan, np.nan, np.nan, 1.0
+        return np.nan, np.nan, np.nan, np.nan, 1.0, False
     prr = (a / n1) / (c / n2)
     se_ln_prr = np.sqrt(1.0 / a + 1.0 / c - 1.0 / n1 - 1.0 / n2) if a > 0 and c > 0 else np.nan
     ci_lower = np.exp(np.log(prr) - 1.96 * se_ln_prr) if not np.isnan(se_ln_prr) else np.nan
@@ -32,11 +40,16 @@ def compute_prr(a, b, c, d):
         except ValueError:
             chi2_val, p_val = np.nan, 1.0
 
-    is_signal = (prr >= 2) and (a >= 3) and (p_val < 0.05) if not np.isnan(prr) else False
+    is_signal = (prr >= prr_threshold) and (a >= min_report_count) and (p_val < p_value_threshold) if not np.isnan(prr) else False
     return prr, ci_lower, ci_upper, chi2_val, p_val, is_signal
 
 
-def compute_ror(a, b, c, d):
+def compute_ror(a, b, c, d, config=None):
+    if config is None:
+        config = get_active_config()
+
+    ror_lower_threshold = config.get("ror_lower_threshold", 1.0)
+
     if a == 0 or b == 0 or c == 0 or d == 0:
         ror = np.nan
         ci_lower = np.nan
@@ -46,11 +59,16 @@ def compute_ror(a, b, c, d):
         se_ln_ror = np.sqrt(1.0 / a + 1.0 / b + 1.0 / c + 1.0 / d)
         ci_lower = np.exp(np.log(ror) - 1.96 * se_ln_ror)
         ci_upper = np.exp(np.log(ror) + 1.96 * se_ln_ror)
-    is_signal = ci_lower > 1 if not np.isnan(ci_lower) else False
+    is_signal = ci_lower > ror_lower_threshold if not np.isnan(ci_lower) else False
     return ror, ci_lower, ci_upper, is_signal
 
 
-def compute_bcpnn(a, b, c, d):
+def compute_bcpnn(a, b, c, d, config=None):
+    if config is None:
+        config = get_active_config()
+
+    ic025_threshold = config.get("ic025_threshold", 0.0)
+
     N = a + b + c + d
     if N == 0:
         return np.nan, np.nan, False
@@ -89,7 +107,7 @@ def compute_bcpnn(a, b, c, d):
     var_ic_approx = max(var_ic_approx, 1e-10)
     sd_ic = np.sqrt(var_ic_approx)
     IC025 = IC - 1.645 * sd_ic
-    is_signal = IC025 > 0
+    is_signal = IC025 > ic025_threshold
     return IC, IC025, is_signal
 
 
@@ -97,7 +115,12 @@ def _log_gamma(x):
     return gammaln(x)
 
 
-def compute_mgps(a, b, c, d):
+def compute_mgps(a, b, c, d, config=None):
+    if config is None:
+        config = get_active_config()
+
+    eb05_threshold = config.get("eb05_threshold", 2.0)
+
     N = a + b + c + d
     if N == 0 or a == 0:
         return np.nan, np.nan, False
@@ -174,13 +197,17 @@ def compute_mgps(a, b, c, d):
     samples = np.where(mask, comp1, comp2)
     EB05 = np.percentile(samples, 10)
 
-    is_signal = EB05 >= 2
+    is_signal = EB05 >= eb05_threshold
     return EBGM, EB05, is_signal
 
 
-def compute_signal_strength(prr_signal, ror_signal, bcpnn_signal, mgps_signal):
+def compute_signal_strength(prr_signal, ror_signal, bcpnn_signal, mgps_signal, config=None):
+    if config is None:
+        config = get_active_config()
+
+    strong_min_methods = config.get("strong_signal_min_methods", 3)
     count = int(prr_signal) + int(ror_signal) + int(bcpnn_signal) + int(mgps_signal)
-    if count >= 3:
+    if count >= strong_min_methods:
         return count, "强信号"
     elif count == 2:
         return count, "中等信号"
@@ -190,7 +217,10 @@ def compute_signal_strength(prr_signal, ror_signal, bcpnn_signal, mgps_signal):
         return count, "无信号"
 
 
-def run_signal_detection(df=None):
+def run_signal_detection(df=None, config=None):
+    if config is None:
+        config = get_active_config()
+
     if df is None:
         from data_import import load_reports
         df = load_reports()
@@ -206,12 +236,12 @@ def run_signal_detection(df=None):
         event = row["event_type"]
         a, b, c, d = build_contingency_table(df, device, event)
 
-        prr_val, prr_ci_l, prr_ci_u, chi2, p_val, prr_sig = compute_prr(a, b, c, d)
-        ror_val, ror_ci_l, ror_ci_u, ror_sig = compute_ror(a, b, c, d)
-        ic_val, ic025, bcpnn_sig = compute_bcpnn(a, b, c, d)
-        ebgm_val, eb05, mgps_sig = compute_mgps(a, b, c, d)
+        prr_val, prr_ci_l, prr_ci_u, chi2, p_val, prr_sig = compute_prr(a, b, c, d, config)
+        ror_val, ror_ci_l, ror_ci_u, ror_sig = compute_ror(a, b, c, d, config)
+        ic_val, ic025, bcpnn_sig = compute_bcpnn(a, b, c, d, config)
+        ebgm_val, eb05, mgps_sig = compute_mgps(a, b, c, d, config)
 
-        sig_count, strength = compute_signal_strength(prr_sig, ror_sig, bcpnn_sig, mgps_sig)
+        sig_count, strength = compute_signal_strength(prr_sig, ror_sig, bcpnn_sig, mgps_sig, config)
 
         results.append({
             "device_name": device,

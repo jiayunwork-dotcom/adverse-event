@@ -112,4 +112,84 @@ def init_db():
         );
 
         CREATE INDEX IF NOT EXISTS idx_cusum_device ON cusum_alerts(device_name);
+
+        CREATE TABLE IF NOT EXISTS signal_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_name TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            signal_strength TEXT NOT NULL CHECK(signal_strength IN ('强信号', '中等信号')),
+            prr_value REAL,
+            report_count INTEGER,
+            detection_run_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (detection_run_id) REFERENCES detection_runs(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_alerts_device ON signal_alerts(device_name);
+        CREATE INDEX IF NOT EXISTS idx_alerts_strength ON signal_alerts(signal_strength);
+        CREATE INDEX IF NOT EXISTS idx_alerts_created ON signal_alerts(created_at);
+
+        CREATE TABLE IF NOT EXISTS detection_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prr_threshold REAL DEFAULT 2.0,
+            min_report_count INTEGER DEFAULT 3,
+            p_value_threshold REAL DEFAULT 0.05,
+            ror_lower_threshold REAL DEFAULT 1.0,
+            ic025_threshold REAL DEFAULT 0.0,
+            eb05_threshold REAL DEFAULT 2.0,
+            strong_signal_min_methods INTEGER DEFAULT 3,
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_by TEXT DEFAULT '系统'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_config_active ON detection_config(is_active);
+
+        CREATE TABLE IF NOT EXISTS detection_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            total_reports INTEGER,
+            total_signals INTEGER,
+            strong_signals INTEGER,
+            medium_signals INTEGER,
+            weak_signals INTEGER,
+            config_id INTEGER,
+            FOREIGN KEY (config_id) REFERENCES detection_config(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_runs_time ON detection_runs(run_time);
+
+        CREATE TABLE IF NOT EXISTS signal_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            detection_run_id INTEGER NOT NULL,
+            device_name TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            report_count INTEGER,
+            prr_value REAL,
+            ror_value REAL,
+            ic_value REAL,
+            ebgm_value REAL,
+            signal_count INTEGER,
+            signal_strength TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (detection_run_id) REFERENCES detection_runs(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_history_run ON signal_history(detection_run_id);
+        CREATE INDEX IF NOT EXISTS idx_history_pair ON signal_history(device_name, event_type);
+
+        CREATE TABLE IF NOT EXISTS signal_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            detection_run_id INTEGER NOT NULL,
+            device_name TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            previous_strength TEXT,
+            current_strength TEXT,
+            change_type TEXT NOT NULL CHECK(change_type IN ('升级', '降级', '新增', '消失')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (detection_run_id) REFERENCES detection_runs(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_changes_run ON signal_changes(detection_run_id);
+        CREATE INDEX IF NOT EXISTS idx_changes_type ON signal_changes(change_type);
         """)

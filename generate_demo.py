@@ -9,8 +9,12 @@ from data_import import import_data, rename_columns
 from algorithms import run_signal_detection, save_signals
 from correction import apply_corrections
 from workflow import init_workflow_for_signals
+from config_manager import init_default_config, get_active_config
+from signal_tracker import create_detection_run, save_signal_history, detect_changes
+from alert_manager import generate_alerts
 
 init_db()
+init_default_config()
 
 np.random.seed(42)
 
@@ -90,11 +94,21 @@ print(f"Event types: {df['事件类型'].value_counts().to_dict()}")
 dup_count, new_count = import_data(df, skip_db_duplicates=False)
 print(f"Imported: {new_count} new records, {dup_count} duplicates skipped")
 
-result_df = run_signal_detection()
+active_config = get_active_config()
+config_id = active_config.get("id")
+
+result_df = run_signal_detection(config=active_config)
 if not result_df.empty:
     result_df = apply_corrections(result_df)
     save_signals(result_df)
     init_workflow_for_signals()
+
+    total_reports = len(df)
+    detection_run_id = create_detection_run(total_reports, result_df, config_id)
+    save_signal_history(detection_run_id, result_df)
+    detect_changes(detection_run_id, result_df)
+    generate_alerts(result_df, detection_run_id)
+
     print(f"Signal detection complete: {len(result_df)} signals found")
     print(result_df[["device_name", "event_type", "signal_strength"]].to_string())
 else:
