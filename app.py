@@ -47,7 +47,12 @@ if "detection_page_tab" not in st.session_state:
 if "selected_signal_for_detail" not in st.session_state:
     st.session_state.selected_signal_for_detail = None
 
-page = st.sidebar.selectbox("导航", [
+if st.session_state.selected_signal_for_detail is not None:
+    default_page = "📊 信号检测"
+else:
+    default_page = "🏠 数据概览"
+
+page_options = [
     "🏠 数据概览",
     "📥 数据导入",
     "🔍 数据浏览",
@@ -59,7 +64,12 @@ page = st.sidebar.selectbox("导航", [
     "📋 信号看板",
     "⚙️ 检测参数配置",
     "📄 报告导出",
-])
+]
+default_index = page_options.index(default_page)
+page = st.sidebar.selectbox("导航", page_options, index=default_index)
+
+if page != "📊 信号检测" and st.session_state.selected_signal_for_detail is not None:
+    st.session_state.selected_signal_for_detail = None
 
 
 def page_overview():
@@ -283,6 +293,40 @@ def page_detection():
         st.session_state.detection_page_tab = "检测结果" if tab1 else "信号变化"
 
         with tab1:
+            if st.session_state.selected_signal_for_detail is not None:
+                sel = st.session_state.selected_signal_for_detail
+                st.subheader(f"📋 信号详细分析: {sel['device_name']} - {sel['event_type']}")
+                detail = get_signal_detail(sel['device_name'], sel['event_type'])
+                if detail:
+                    metrics_col = st.columns(4)
+                    with metrics_col[0]:
+                        st.metric("PRR", f"{detail['prr_value']:.3f}" if detail.get('prr_value') else "N/A",
+                                  delta=f"CI: [{detail.get('prr_ci_lower', 'N/A'):.3f}, {detail.get('prr_ci_upper', 'N/A'):.3f}]" if detail.get('prr_ci_lower') else None)
+                    with metrics_col[1]:
+                        st.metric("ROR", f"{detail['ror_value']:.3f}" if detail.get('ror_value') else "N/A",
+                                  delta=f"CI: [{detail.get('ror_ci_lower', 'N/A'):.3f}, {detail.get('ror_ci_upper', 'N/A'):.3f}]" if detail.get('ror_ci_lower') else None)
+                    with metrics_col[2]:
+                        st.metric("IC (BCPNN)", f"{detail['ic_value']:.3f}" if detail.get('ic_value') else "N/A",
+                                  delta=f"IC025: {detail.get('ic025', 'N/A'):.3f}" if detail.get('ic025') else None)
+                    with metrics_col[3]:
+                        st.metric("EBGM (MGPS)", f"{detail['ebgm_value']:.3f}" if detail.get('ebgm_value') else "N/A",
+                                  delta=f"EB05: {detail.get('eb05', 'N/A'):.3f}" if detail.get('eb05') else None)
+
+                    all_reports = load_reports()
+                    dev_reports = all_reports[all_reports["device_name"] == sel['device_name']]
+                    if not dev_reports.empty:
+                        monthly = compute_monthly_counts(dev_reports, sel['device_name'])
+                        fig_t = px.line(monthly, x="year_month", y="count", markers=True, title=f"{sel['device_name']} 时间分布")
+                        st.plotly_chart(fig_t, use_container_width=True, key="detail_trend_tab1")
+
+                    col_back, _ = st.columns([1, 4])
+                    with col_back:
+                        if st.button("← 返回列表", type="primary", use_container_width=True, key="back_btn_tab1"):
+                            st.session_state.selected_signal_for_detail = None
+                            st.rerun()
+
+                    st.divider()
+
             correction_label = {"fdr": "FDR校正后", "bonferroni": "Bonferroni校正后", "none": "校正前"}
             show_corrected = correction_method != "none"
 
@@ -329,6 +373,41 @@ def page_detection():
 
         with tab2:
             st.session_state.detection_page_tab = "信号变化"
+
+            if st.session_state.selected_signal_for_detail is not None:
+                sel = st.session_state.selected_signal_for_detail
+                st.subheader(f"📋 信号详细分析: {sel['device_name']} - {sel['event_type']}")
+                detail = get_signal_detail(sel['device_name'], sel['event_type'])
+                if detail:
+                    metrics_col = st.columns(4)
+                    with metrics_col[0]:
+                        st.metric("PRR", f"{detail['prr_value']:.3f}" if detail.get('prr_value') else "N/A",
+                                  delta=f"CI: [{detail.get('prr_ci_lower', 'N/A'):.3f}, {detail.get('prr_ci_upper', 'N/A'):.3f}]" if detail.get('prr_ci_lower') else None)
+                    with metrics_col[1]:
+                        st.metric("ROR", f"{detail['ror_value']:.3f}" if detail.get('ror_value') else "N/A",
+                                  delta=f"CI: [{detail.get('ror_ci_lower', 'N/A'):.3f}, {detail.get('ror_ci_upper', 'N/A'):.3f}]" if detail.get('ror_ci_lower') else None)
+                    with metrics_col[2]:
+                        st.metric("IC (BCPNN)", f"{detail['ic_value']:.3f}" if detail.get('ic_value') else "N/A",
+                                  delta=f"IC025: {detail.get('ic025', 'N/A'):.3f}" if detail.get('ic025') else None)
+                    with metrics_col[3]:
+                        st.metric("EBGM (MGPS)", f"{detail['ebgm_value']:.3f}" if detail.get('ebgm_value') else "N/A",
+                                  delta=f"EB05: {detail.get('eb05', 'N/A'):.3f}" if detail.get('eb05') else None)
+
+                    all_reports = load_reports()
+                    dev_reports = all_reports[all_reports["device_name"] == sel['device_name']]
+                    if not dev_reports.empty:
+                        monthly = compute_monthly_counts(dev_reports, sel['device_name'])
+                        fig_t = px.line(monthly, x="year_month", y="count", markers=True, title=f"{sel['device_name']} 时间分布")
+                        st.plotly_chart(fig_t, use_container_width=True, key="detail_trend_tab2")
+
+                    col_back, _ = st.columns([1, 4])
+                    with col_back:
+                        if st.button("← 返回列表", type="primary", use_container_width=True, key="back_btn_tab2"):
+                            st.session_state.selected_signal_for_detail = None
+                            st.rerun()
+
+                    st.divider()
+
             st.subheader("🔄 信号变化对比")
             last_run = get_last_detection_run()
             if not last_run:

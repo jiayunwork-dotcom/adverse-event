@@ -275,6 +275,7 @@ def save_signals(result_df):
     if result_df.empty:
         return
     with get_db() as conn:
+        conn.execute("DELETE FROM signal_workflow")
         conn.execute("DELETE FROM signals")
         cols = [
             "device_name", "event_type", "report_count",
