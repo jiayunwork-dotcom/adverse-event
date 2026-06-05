@@ -36,11 +36,16 @@ from review_module import (
     get_kanban_data as get_review_kanban,
     get_all_reviewers, add_reviewer, update_reviewer, delete_reviewer,
     get_report_version, get_all_report_versions, compare_report_versions,
+    compare_report_versions_enhanced,
     submit_for_review, make_review_decision,
     get_annotations, add_annotation, add_annotation_reply, set_annotation_status,
     get_annotation_count_by_signal, get_review_statistics, get_review_history,
     get_report_assignments, get_reviewer_by_name,
-    REVIEWER_ROLES, ANNOTATION_TYPES, ANNOTATION_STATUSES,
+    get_remaining_time, extend_deadline, force_close,
+    get_my_todo_list,
+    create_annotation_template, update_annotation_template, delete_annotation_template, get_annotation_templates,
+    export_review_comments,
+    REVIEWER_ROLES, ANNOTATION_TYPES, ANNOTATION_PRIORITIES, ANNOTATION_STATUSES,
 )
 
 st.set_page_config(page_title="医疗器械不良事件信号检测平台", layout="wide", page_icon="🔬")
@@ -1161,9 +1166,9 @@ def page_review_kanban():
         st.session_state.review_page_tab = "报告审阅看板"
         kanban = get_review_kanban()
 
-        status_cols = st.columns(4)
-        status_names = ["草稿", "审阅中", "已批准", "已退回"]
-        status_colors = ["#95a5a6", "#3498db", "#27ae60", "#e74c3c"]
+        status_cols = st.columns(5)
+        status_names = ["草稿", "审阅中", "已批准", "已退回", "已超时"]
+        status_colors = ["#95a5a6", "#3498db", "#27ae60", "#e74c3c", "#8e44ad"]
 
         for i, (status, color) in enumerate(zip(status_names, status_colors)):
             with status_cols[i]:
@@ -1172,11 +1177,21 @@ def page_review_kanban():
                 st.divider()
 
                 for idx, item in enumerate(items):
+                    card_style = "border: 2px solid #e74c3c;" if item.get("is_urgent") else ""
                     with st.container(border=True):
                         col_info, col_actions = st.columns([3, 2])
                         with col_info:
                             st.markdown(f"**📄 版本 v{item['version_number']}**")
                             st.caption(f"🕐 {item['generation_time']}")
+                            
+                            if item.get("remaining_time"):
+                                if item.get("is_urgent"):
+                                    st.markdown(f"<span style='color:#e74c3c;font-weight:bold;'>⏰ 即将超时</span>", unsafe_allow_html=True)
+                                elif item["status"] != "已超时":
+                                    st.markdown(f"⏰ {item['remaining_time']}")
+                                if item.get("deadline"):
+                                    st.caption(f"截止时间: {item['deadline'][:19]}")
+                            
                             st.markdown(f"📊 信号数: **{item['signal_count']}** 条")
                             annot_badge = f" <span style='background-color:#e74c3c;color:white;padding:2px 8px;border-radius:10px;font-size:12px;'>💬 {item['annotation_count']}</span>" if item['annotation_count'] > 0 else ""
                             st.markdown(f"📝 批注数: {item['annotation_count']}{annot_badge}", unsafe_allow_html=True)
@@ -1187,6 +1202,9 @@ def page_review_kanban():
 
                             if item["status"] == "已退回" and item.get("reject_reason"):
                                 st.error(f"❌ 退回理由: {item['reject_reason']}")
+                            
+                            if item["status"] == "已超时":
+                                st.warning("⚠️ 报告已超时，审阅人无法操作")
 
                         with col_actions:
                             if st.button("查看详情", key=f"view_report_{item['id']}_{idx}", use_container_width=True, type="primary"):
@@ -1224,6 +1242,21 @@ def page_review_kanban():
                                                     st.rerun()
                                                 except Exception as e:
                                                     st.error(str(e))
+                            
+                            if item["status"] == "已超时" and st.session_state.current_reviewer:
+                                is_submitter = item.get("submitter") == st.session_state.current_reviewer["name"]
+                                if is_submitter:
+                                    st.caption("发起人操作:")
+                                    if st.button("延期", key=f"extend_{item['id']}_{idx}", use_container_width=True):
+                                        st.session_state[f"extend_dialog_{item['id']}"] = True
+                                        st.rerun()
+                                    if st.button("强制关闭", key=f"close_{item['id']}_{idx}", use_container_width=True):
+                                        try:
+                                            force_close(item["id"], st.session_state.current_reviewer["id"])
+                                            st.success("✅ 已强制关闭")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(str(e))
 
                     if st.session_state.get(f"submit_dialog_{item['id']}"):
                         with st.expander(f"选择审阅人 - 版本 v{item['version_number']}", expanded=True):
@@ -1233,10 +1266,25 @@ def page_review_kanban():
                                 [f"{r['name']} ({r['role']})" for r in reviewers],
                                 key=f"reviewer_select_{item['id']}"
                             )
+                            from datetime import datetime, timedelta
+                            col_d1, col_d2 = st.columns(2)
+                            with col_d1:
+                                deadline_date = st.date_input(
+                                    "截止日期",
+                                    value=datetime.now() + timedelta(days=7),
+                                    key=f"deadline_date_{item['id']}"
+                                )
+                            with col_d2:
+                                deadline_time = st.time_input(
+                                    "截止时间",
+                                    value=datetime.now().time().replace(hour=17, minute=0),
+                                    key=f"deadline_time_{item['id']}"
+                                )
                             col_s, col_c = st.columns(2)
                             with col_s:
                                 if st.button("确认提交", key=f"confirm_submit_{item['id']}", type="primary", use_container_width=True):
                                     if selected:
+                                        deadline = datetime.combine(deadline_date, deadline_time).strftime("%Y-%m-%d %H:%M:%S")
                                         reviewer_ids = []
                                         for s in selected:
                                             name = s.split(" (")[0]
@@ -1247,6 +1295,7 @@ def page_review_kanban():
                                             submit_for_review(
                                                 item["id"],
                                                 reviewer_ids,
+                                                deadline,
                                                 submitter_name=st.session_state.current_reviewer["name"] if st.session_state.current_reviewer else "系统"
                                             )
                                             st.success("✅ 已提交审阅")
@@ -1254,24 +1303,64 @@ def page_review_kanban():
                                             st.rerun()
                                         except Exception as e:
                                             st.error(str(e))
+                                    else:
+                                        st.error("请至少选择一位审阅人")
                             with col_c:
                                 if st.button("取消", key=f"cancel_submit_{item['id']}", use_container_width=True):
                                     st.session_state[f"submit_dialog_{item['id']}"] = False
+                                    st.rerun()
+                    
+                    if st.session_state.get(f"extend_dialog_{item['id']}"):
+                        with st.expander(f"延期处理 - 版本 v{item['version_number']}", expanded=True):
+                            from datetime import datetime, timedelta
+                            col_d1, col_d2 = st.columns(2)
+                            with col_d1:
+                                new_deadline_date = st.date_input(
+                                    "新截止日期",
+                                    value=datetime.now() + timedelta(days=3),
+                                    key=f"new_deadline_date_{item['id']}"
+                                )
+                            with col_d2:
+                                new_deadline_time = st.time_input(
+                                    "新截止时间",
+                                    value=datetime.now().time().replace(hour=17, minute=0),
+                                    key=f"new_deadline_time_{item['id']}"
+                                )
+                            col_s, col_c = st.columns(2)
+                            with col_s:
+                                if st.button("确认延期", key=f"confirm_extend_{item['id']}", type="primary", use_container_width=True):
+                                    new_deadline = datetime.combine(new_deadline_date, new_deadline_time).strftime("%Y-%m-%d %H:%M:%S")
+                                    try:
+                                        extend_deadline(
+                                            item["id"],
+                                            new_deadline,
+                                            st.session_state.current_reviewer["id"]
+                                        )
+                                        st.success("✅ 已延期")
+                                        st.session_state[f"extend_dialog_{item['id']}"] = False
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(str(e))
+                            with col_c:
+                                if st.button("取消", key=f"cancel_extend_{item['id']}", use_container_width=True):
+                                    st.session_state[f"extend_dialog_{item['id']}"] = False
                                     st.rerun()
 
     with tab2:
         st.session_state.review_page_tab = "审阅统计"
         stats = get_review_statistics()
 
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
             st.metric("平均审阅耗时", f"{stats['avg_review_days']} 天")
         with col2:
             st.metric("退回率", f"{stats['reject_rate']} %")
         with col3:
+            st.metric("超时率", f"{stats['timeout_rate']} %", help="超时报告数 / 提交审阅数")
+        with col4:
             total = sum(stats.get("status_distribution", {}).values())
             st.metric("报告总数", total)
-        with col4:
+        with col5:
             approved = stats.get("status_distribution", {}).get("已批准", 0)
             st.metric("已批准报告", approved)
 
@@ -1313,7 +1402,7 @@ def page_review_kanban():
                 {"状态": k, "数量": v} for k, v in stats["status_distribution"].items()
             ])
             fig3 = px.pie(sdf, values="数量", names="状态", hole=0.4,
-                          color_discrete_map={"草稿": "#95a5a6", "审阅中": "#3498db", "已批准": "#27ae60", "已退回": "#e74c3c"})
+                          color_discrete_map={"草稿": "#95a5a6", "审阅中": "#3498db", "已批准": "#27ae60", "已退回": "#e74c3c", "已超时": "#8e44ad"})
             st.plotly_chart(fig3, use_container_width=True)
 
     with tab3:
@@ -1332,7 +1421,7 @@ def page_review_kanban():
             if st.button("开始对比", key="compare_btn_review", type="primary"):
                 v1_id = version_map[v1_sel]
                 v2_id = version_map[v2_sel]
-                changes = compare_report_versions(v1_id, v2_id)
+                changes = compare_report_versions_enhanced(v1_id, v2_id)
                 if not changes:
                     st.info("两个版本之间没有信号强度变化")
                 else:
@@ -1343,9 +1432,16 @@ def page_review_kanban():
                     change_type_colors = {
                         "新增": "#1f77b4", "消失": "#7f7f7f", "升级": "#d62728", "降级": "#2ca02c"
                     }
+                    
+                    metric_cols = st.columns(4)
+                    metric_cols[0].markdown("**🔴 PRR变化**")
+                    metric_cols[1].markdown("**🔴 ROR变化**")
+                    metric_cols[2].markdown("**🔴 IC变化**")
+                    metric_cols[3].markdown("**🔴 EBGM变化**")
+                    
                     for c in changes:
                         with st.container(border=True):
-                            col1, col2, col3, col4 = st.columns([2, 1, 2, 2])
+                            col1, col2, col3 = st.columns([2, 1, 2])
                             with col1:
                                 st.markdown(f"**{c['device_name']}** - {c['event_type']}")
                             with col2:
@@ -1359,16 +1455,63 @@ def page_review_kanban():
                                 oc = strength_color.get(old_s, "#999")
                                 nc = strength_color.get(new_s, "#999")
                                 st.markdown(f"<span style='color:{oc};'>{old_s}</span> → <span style='color:{nc};'>{new_s}</span>", unsafe_allow_html=True)
-                            with col4:
-                                if c.get('old_signal'):
-                                    old_prr = f"{c['old_signal']['prr_value']:.3f}" if c['old_signal'].get('prr_value') else "N/A"
+                            
+                            metric_row = st.columns(4)
+                            for i, metric in enumerate(["prr_change", "ror_change", "ic_change", "ebgm_change"]):
+                                change = c.get(metric)
+                                metric_name = {"prr_change": "PRR", "ror_change": "ROR", "ic_change": "IC", "ebgm_change": "EBGM"}[metric]
+                                if change:
+                                    arrow = "🔴 ↑" if change["direction"] == "up" else "🟢 ↓" if change["direction"] == "down" else "➡️"
+                                    diff_text = f"+{change['diff']:.3f}" if change["diff"] > 0 else f"{change['diff']:.3f}"
+                                    metric_row[i].markdown(f"{arrow} **{metric_name}**: {change['old']:.3f} → {change['new']:.3f} ({diff_text})")
                                 else:
-                                    old_prr = "N/A"
-                                if c.get('new_signal'):
-                                    new_prr = f"{c['new_signal']['prr_value']:.3f}" if c['new_signal'].get('prr_value') else "N/A"
-                                else:
-                                    new_prr = "N/A"
-                                st.caption(f"PRR: {old_prr} → {new_prr}")
+                                    metric_row[i].markdown(f"➡️ **{metric_name}**: N/A")
+                            
+                            if c.get("trend_data") and len(c["trend_data"]) >= 2:
+                                with st.expander("📈 变化趋势迷你图", expanded=False):
+                                    trend_df = pd.DataFrame(c["trend_data"])
+                                    fig = go.Figure()
+                                    fig.add_trace(go.Scatter(
+                                        x=trend_df["version_number"].astype(str),
+                                        y=trend_df["strength_value"],
+                                        mode="lines+markers",
+                                        name="信号强度",
+                                        line=dict(color="#1f77b4", width=2),
+                                        marker=dict(size=8)
+                                    ))
+                                    fig.update_layout(
+                                        title=f"{c['device_name']} - {c['event_type']} 信号强度趋势",
+                                        xaxis_title="版本号",
+                                        yaxis_title="信号强度",
+                                        yaxis=dict(
+                                            tickvals=[0, 1, 2, 3],
+                                            ticktext=["无信号", "弱信号", "中等信号", "强信号"]
+                                        ),
+                                        height=250,
+                                        margin=dict(l=0, r=0, t=40, b=0)
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
+                                    
+                                    if "prr_value" in trend_df.columns:
+                                        prr_vals = trend_df.dropna(subset=["prr_value"])
+                                        if len(prr_vals) >= 2:
+                                            fig2 = go.Figure()
+                                            fig2.add_trace(go.Scatter(
+                                                x=prr_vals["version_number"].astype(str),
+                                                y=prr_vals["prr_value"],
+                                                mode="lines+markers",
+                                                name="PRR值",
+                                                line=dict(color="#d62728", width=2),
+                                                marker=dict(size=8)
+                                            ))
+                                            fig2.update_layout(
+                                                title="PRR值趋势",
+                                                xaxis_title="版本号",
+                                                yaxis_title="PRR值",
+                                                height=200,
+                                                margin=dict(l=0, r=0, t=40, b=0)
+                                            )
+                                            st.plotly_chart(fig2, use_container_width=True)
 
 
 def page_report_detail():
@@ -1380,16 +1523,30 @@ def page_report_detail():
 
     st.title(f"📄 报告详情 - 版本 v{report['version_number']}")
 
-    col_back, col_info = st.columns([1, 4])
+    col_back, col_info, col_export = st.columns([1, 3, 1])
     with col_back:
         if st.button("← 返回看板", type="primary", use_container_width=True):
             st.session_state.selected_report_for_detail = None
             st.rerun()
+    with col_export:
+        if st.button("📥 导出审阅意见", type="secondary", use_container_width=True):
+            from datetime import datetime
+            csv_content = export_review_comments(report_id)
+            today = datetime.now().strftime("%Y%m%d")
+            filename = f"审阅意见_v{report['version_number']}_{today}.csv"
+            st.download_button(
+                label="💾 下载CSV文件",
+                data=csv_content,
+                file_name=filename,
+                mime="text/csv",
+                use_container_width=True,
+                key="download_review_comments"
+            )
 
-    status_colors = {"草稿": "#95a5a6", "审阅中": "#3498db", "已批准": "#27ae60", "已退回": "#e74c3c"}
+    status_colors = {"草稿": "#95a5a6", "审阅中": "#3498db", "已批准": "#27ae60", "已退回": "#e74c3c", "已超时": "#8e44ad"}
     sc = status_colors.get(report["status"], "#333")
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         st.metric("版本号", f"v{report['version_number']}")
     with col2:
@@ -1398,6 +1555,13 @@ def page_report_detail():
         st.metric("生成时间", str(report.get("generation_time", "N/A"))[:19])
     with col4:
         st.metric("信号数量", report.get("signal_count", len(report.get("signals", []))))
+    with col5:
+        if report.get("deadline"):
+            remaining, seconds = get_remaining_time(report_id)
+            if seconds and seconds < 24 * 3600 and seconds > 0:
+                st.metric("截止时间", f"<span style='color:#e74c3c;'>{report['deadline'][:19]}</span>", help="即将超时")
+            else:
+                st.metric("截止时间", report['deadline'][:19])
 
     if report.get("submitter"):
         st.caption(f"👤 提交人: {report['submitter']} | 📅 提交时间: {report.get('submitted_at', 'N/A')}")
@@ -1450,13 +1614,45 @@ def page_report_detail():
                     if st.session_state.current_reviewer and st.session_state.get(f"show_add_annot_{signal_id}"):
                         st.divider()
                         st.markdown("**✏️ 添加批注**")
-                        annot_type = st.selectbox(
-                            "批注类型",
-                            ANNOTATION_TYPES,
-                            key=f"annot_type_{signal_id}"
-                        )
+                        
+                        templates = get_annotation_templates(st.session_state.current_reviewer["id"])
+                        if templates:
+                            template_options = ["手动输入"] + [f"{t['name']} ({'公共' if t['is_public'] else '个人'})" for t in templates]
+                            selected_template = st.selectbox(
+                                "选择批注模板",
+                                template_options,
+                                key=f"template_select_{signal_id}"
+                            )
+                            
+                            if selected_template != "手动输入":
+                                template_idx = template_options.index(selected_template) - 1
+                                selected_t = templates[template_idx]
+                                st.info(f"💡 模板内容: {selected_t['content']}")
+                                if st.button("使用此模板", key=f"use_template_{signal_id}", use_container_width=True):
+                                    st.session_state[f"template_content_{signal_id}"] = selected_t["content"]
+                                    st.session_state[f"template_type_{signal_id}"] = selected_t["annotation_type"]
+                                    st.session_state[f"template_priority_{signal_id}"] = selected_t["priority"]
+                                    st.rerun()
+                        
+                        col_t1, col_t2 = st.columns(2)
+                        with col_t1:
+                            annot_type = st.selectbox(
+                                "批注类型",
+                                ANNOTATION_TYPES,
+                                index=ANNOTATION_TYPES.index(st.session_state.get(f"template_type_{signal_id}", "疑问")),
+                                key=f"annot_type_{signal_id}"
+                            )
+                        with col_t2:
+                            annot_priority = st.selectbox(
+                                "优先级",
+                                ANNOTATION_PRIORITIES,
+                                index=ANNOTATION_PRIORITIES.index(st.session_state.get(f"template_priority_{signal_id}", "普通")),
+                                key=f"annot_priority_{signal_id}"
+                            )
+                        
                         annot_content = st.text_area(
                             "批注内容",
+                            value=st.session_state.get(f"template_content_{signal_id}", ""),
                             key=f"annot_content_{signal_id}",
                             height=80,
                             placeholder="请输入批注内容..."
@@ -1470,16 +1666,21 @@ def page_report_detail():
                                         signal_id,
                                         annot_content.strip(),
                                         annot_type,
-                                        st.session_state.current_reviewer["id"]
+                                        st.session_state.current_reviewer["id"],
+                                        annot_priority
                                     )
                                     st.success("✅ 批注已添加")
                                     st.session_state[f"show_add_annot_{signal_id}"] = False
+                                    st.session_state[f"template_content_{signal_id}"] = ""
+                                    st.session_state[f"template_type_{signal_id}"] = "疑问"
+                                    st.session_state[f"template_priority_{signal_id}"] = "普通"
                                     st.rerun()
                                 else:
                                     st.error("批注内容不能为空")
                         with col_cb:
                             if st.button("取消", key=f"cancel_annot_{signal_id}", use_container_width=True):
                                 st.session_state[f"show_add_annot_{signal_id}"] = False
+                                st.session_state[f"template_content_{signal_id}"] = ""
                                 st.rerun()
                     elif st.session_state.current_reviewer:
                         if st.button("➕ 添加批注", key=f"add_annot_btn_{signal_id}", use_container_width=True):
@@ -1550,10 +1751,23 @@ def page_report_detail():
 def _display_annotations(annotations, report_id, signal_id):
     type_icons = {"疑问": "❓", "建议": "💡", "反对": "🚫", "确认": "✅"}
     type_colors = {"疑问": "#3498db", "建议": "#27ae60", "反对": "#e74c3c", "确认": "#9b59b6"}
+    priority_colors = {"紧急": "#e74c3c", "普通": "#95a5a6", "低": "#7f8c8d"}
+    priority_labels = {"紧急": "🔴 紧急", "普通": "⚪ 普通", "低": "🔵 低"}
 
     for ann in annotations:
         is_resolved = ann["status"] == "已解决"
+        priority = ann.get("priority", "普通")
+        is_urgent = priority == "紧急" and not is_resolved
+        
+        border_style = "border: 2px solid #e74c3c;" if is_urgent else ""
+        
         with st.container(border=True):
+            if is_urgent:
+                st.markdown(
+                    f"<div style='background-color:#fff5f5;padding:8px;border-radius:4px;margin-bottom:8px;'>"
+                    f"<span style='color:#e74c3c;font-weight:bold;'>🔴 紧急批注</span></div>",
+                    unsafe_allow_html=True
+                )
             if is_resolved:
                 st.caption("✅ 已解决")
 
@@ -1561,9 +1775,12 @@ def _display_annotations(annotations, report_id, signal_id):
             with col_h:
                 icon = type_icons.get(ann["annotation_type"], "")
                 tc = type_colors.get(ann["annotation_type"], "#333")
+                pc = priority_colors.get(priority, "#333")
+                pl = priority_labels.get(priority, "普通")
                 st.markdown(
                     f"<span style='color:{tc};font-weight:bold;'>{icon} {ann['annotation_type']}</span> "
-                    f"by **{ann['author_name']}** ({ann['author_role']}) at {ann['created_at'][:19]}",
+                    f"<span style='color:{pc};font-size:12px;margin-left:8px;'>{pl}</span> "
+                    f"<br>by **{ann['author_name']}** ({ann['author_role']}) at {ann['created_at'][:19]}",
                     unsafe_allow_html=True
                 )
             with col_s:
@@ -1619,7 +1836,27 @@ def _display_annotations(annotations, report_id, signal_id):
 def page_reviewer_management():
     st.title("👤 审阅人管理")
 
-    tab1, tab2 = st.tabs(["📋 审阅人列表", "➕ 添加审阅人"])
+    col_cr, _ = st.columns([3, 1])
+    with col_cr:
+        current_reviewer_name = st.selectbox(
+            "选择当前审阅人身份",
+            ["请选择..."] + [r["name"] for r in get_all_reviewers()],
+            key="mgmt_reviewer_selector"
+        )
+        if current_reviewer_name != "请选择...":
+            st.session_state.current_reviewer = get_reviewer_by_name(current_reviewer_name)
+        else:
+            st.session_state.current_reviewer = None
+
+    if st.session_state.current_reviewer:
+        r = st.session_state.current_reviewer
+        role_color = {"初审员": "#2ca02c", "高级审阅员": "#ff7f0e", "主管": "#d62728"}
+        rc = role_color.get(r["role"], "#333")
+        st.success(f"✅ 当前身份: <span style='color:{rc};font-weight:bold;'>{r['name']}</span> ({r['role']})", unsafe_allow_html=True)
+
+    st.divider()
+
+    tab1, tab2, tab3, tab4 = st.tabs(["📋 审阅人列表", "➕ 添加审阅人", "📝 我的待办", "📑 批注模板管理"])
 
     with tab1:
         reviewers = get_all_reviewers()
@@ -1645,18 +1882,19 @@ def page_reviewer_management():
                 if reviewer:
                     col_e1, col_e2 = st.columns(2)
                     with col_e1:
-                        edit_name = st.text_input("姓名", value=reviewer["name"])
+                        edit_name = st.text_input("姓名", value=reviewer["name"], key="edit_name")
                         edit_role = st.selectbox(
                             "角色",
                             REVIEWER_ROLES,
-                            index=REVIEWER_ROLES.index(reviewer["role"]) if reviewer["role"] in REVIEWER_ROLES else 0
+                            index=REVIEWER_ROLES.index(reviewer["role"]) if reviewer["role"] in REVIEWER_ROLES else 0,
+                            key="edit_role"
                         )
                     with col_e2:
-                        edit_email = st.text_input("邮箱", value=reviewer["email"] or "")
+                        edit_email = st.text_input("邮箱", value=reviewer["email"] or "", key="edit_email")
 
                     col_sv, col_dl = st.columns(2)
                     with col_sv:
-                        if st.button("保存修改", type="primary", use_container_width=True):
+                        if st.button("保存修改", type="primary", use_container_width=True, key="save_edit"):
                             try:
                                 update_reviewer(rid, name=edit_name, role=edit_role, email=edit_email)
                                 st.success("✅ 修改成功")
@@ -1664,7 +1902,7 @@ def page_reviewer_management():
                             except Exception as e:
                                 st.error(str(e))
                     with col_dl:
-                        if st.button("删除", use_container_width=True):
+                        if st.button("删除", use_container_width=True, key="delete_reviewer"):
                             try:
                                 delete_reviewer(rid)
                                 st.success("✅ 删除成功")
@@ -1677,10 +1915,10 @@ def page_reviewer_management():
         with st.form("add_reviewer_form"):
             col_f1, col_f2 = st.columns(2)
             with col_f1:
-                new_name = st.text_input("姓名*")
-                new_role = st.selectbox("角色*", REVIEWER_ROLES)
+                new_name = st.text_input("姓名*", key="new_name")
+                new_role = st.selectbox("角色*", REVIEWER_ROLES, key="new_role")
             with col_f2:
-                new_email = st.text_input("邮箱")
+                new_email = st.text_input("邮箱", key="new_email")
 
             submitted = st.form_submit_button("添加", type="primary", use_container_width=True)
             if submitted:
@@ -1693,6 +1931,201 @@ def page_reviewer_management():
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
+
+    with tab3:
+        st.session_state.review_page_tab = "我的待办"
+        if not st.session_state.current_reviewer:
+            st.warning("请先选择当前审阅人身份")
+        else:
+            st.subheader(f"📝 {st.session_state.current_reviewer['name']} 的待办事项")
+            todo_list = get_my_todo_list(st.session_state.current_reviewer["id"])
+            
+            if not todo_list:
+                st.info("暂无待办事项")
+            else:
+                priority_colors = {"紧急": "#e74c3c", "普通": "#95a5a6", "低": "#7f8c8d"}
+                
+                for idx, item in enumerate(todo_list):
+                    pc = priority_colors.get(item["priority"], "#333")
+                    with st.container(border=True):
+                        col_type, col_info, col_action = st.columns([1, 4, 2])
+                        with col_type:
+                            if item["type"] == "review":
+                                st.markdown(f"<div style='text-align:center;padding:8px;background-color:#e8f4fd;border-radius:4px;'>📋<br><b>审阅任务</b></div>", unsafe_allow_html=True)
+                            else:
+                                st.markdown(f"<div style='text-align:center;padding:8px;background-color:#fdecea;border-radius:4px;'>💬<br><b>紧急批注</b></div>", unsafe_allow_html=True)
+                        
+                        with col_info:
+                            if item["priority"] == "紧急":
+                                st.markdown(f"<span style='color:{pc};font-weight:bold;'>🔴 {item['priority']}</span>", unsafe_allow_html=True)
+                            else:
+                                st.markdown(f"<span style='color:{pc};'>⚪ {item['priority']}</span>", unsafe_allow_html=True)
+                            
+                            st.markdown(f"**版本 v{item['version_number']}**")
+                            if item.get("device_name") and item.get("event_type"):
+                                st.caption(f"📌 {item['device_name']} - {item['event_type']}")
+                            
+                            if item["type"] == "review":
+                                if item.get("remaining_time"):
+                                    st.caption(f"⏰ {item['remaining_time']}")
+                                st.caption(f"📊 状态: {item['report_status']}")
+                            else:
+                                st.caption(f"💬 {item['annotation_type']} by {item['author_name']}")
+                                if len(item.get("content", "")) > 50:
+                                    st.caption(f"📝 {item['content'][:50]}...")
+                                else:
+                                    st.caption(f"📝 {item.get('content', '')}")
+                        
+                        with col_action:
+                            if item["type"] == "review":
+                                if st.button("前往审阅", key=f"goto_review_{idx}", use_container_width=True, type="primary"):
+                                    st.session_state.selected_report_for_detail = item["report_version_id"]
+                                    st.rerun()
+                            else:
+                                if st.button("查看批注", key=f"goto_annot_{idx}", use_container_width=True, type="primary"):
+                                    st.session_state.selected_report_for_detail = item["report_version_id"]
+                                    st.session_state[f"active_signal_{item['report_version_id']}"] = item["signal_id"]
+                                    st.rerun()
+
+    with tab4:
+        st.session_state.review_page_tab = "批注模板管理"
+        if not st.session_state.current_reviewer:
+            st.warning("请先选择当前审阅人身份")
+        else:
+            col_add, _ = st.columns([1, 3])
+            with col_add:
+                if st.button("➕ 新建模板", type="primary", use_container_width=True):
+                    st.session_state["show_template_form"] = True
+                    st.rerun()
+            
+            if st.session_state.get("show_template_form"):
+                with st.expander("📝 新建批注模板", expanded=True):
+                    with st.form("template_form"):
+                        col_t1, col_t2 = st.columns(2)
+                        with col_t1:
+                            template_name = st.text_input("模板名称*", key="template_name")
+                            template_type = st.selectbox("批注类型", ANNOTATION_TYPES, key="template_type")
+                        with col_t2:
+                            template_priority = st.selectbox("优先级", ANNOTATION_PRIORITIES, key="template_priority")
+                            is_public = st.checkbox("设为公共模板", value=False, key="template_is_public")
+                        
+                        template_content = st.text_area("批注内容*", height=80, key="template_content")
+                        
+                        col_sub, col_can = st.columns(2)
+                        with col_sub:
+                            submit_template = st.form_submit_button("保存模板", type="primary", use_container_width=True)
+                        with col_can:
+                            cancel_template = st.form_submit_button("取消", use_container_width=True)
+                        
+                        if submit_template:
+                            if not template_name.strip() or not template_content.strip():
+                                st.error("模板名称和内容不能为空")
+                            else:
+                                try:
+                                    create_annotation_template(
+                                        template_name.strip(),
+                                        template_content.strip(),
+                                        template_type,
+                                        template_priority,
+                                        is_public,
+                                        st.session_state.current_reviewer["id"]
+                                    )
+                                    st.success("✅ 模板创建成功")
+                                    st.session_state["show_template_form"] = False
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(str(e))
+                        if cancel_template:
+                            st.session_state["show_template_form"] = False
+                            st.rerun()
+            
+            st.divider()
+            templates = get_annotation_templates(st.session_state.current_reviewer["id"])
+            if not templates:
+                st.info("暂无批注模板")
+            else:
+                public_templates = [t for t in templates if t["is_public"]]
+                personal_templates = [t for t in templates if not t["is_public"] and t["creator_id"] == st.session_state.current_reviewer["id"]]
+                
+                if public_templates:
+                    st.subheader("🌐 公共模板")
+                    for t in public_templates:
+                        with st.container(border=True):
+                            col_info, col_actions = st.columns([4, 1])
+                            with col_info:
+                                st.markdown(f"**{t['name']}**")
+                                st.caption(f"类型: {t['annotation_type']} | 优先级: {t['priority']} | 创建者: {t['creator_name']}")
+                                st.markdown(f"📝 {t['content']}")
+                            with col_actions:
+                                st.caption("公共模板")
+                
+                if personal_templates:
+                    st.subheader("👤 个人模板")
+                    for t in personal_templates:
+                        with st.container(border=True):
+                            col_info, col_actions = st.columns([4, 1])
+                            with col_info:
+                                st.markdown(f"**{t['name']}**")
+                                st.caption(f"类型: {t['annotation_type']} | 优先级: {t['priority']}")
+                                st.markdown(f"📝 {t['content']}")
+                            with col_actions:
+                                if st.button("编辑", key=f"edit_template_{t['id']}", use_container_width=True):
+                                    st.session_state[f"editing_template_{t['id']}"] = True
+                                    st.rerun()
+                                if st.button("删除", key=f"delete_template_{t['id']}", use_container_width=True):
+                                    try:
+                                        delete_annotation_template(t["id"])
+                                        st.success("✅ 模板已删除")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(str(e))
+                            
+                            if st.session_state.get(f"editing_template_{t['id']}"):
+                                with st.expander("编辑模板", expanded=True):
+                                    with st.form(f"edit_form_{t['id']}"):
+                                        col_e1, col_e2 = st.columns(2)
+                                        with col_e1:
+                                            edit_tname = st.text_input("模板名称", value=t["name"], key=f"edit_tname_{t['id']}")
+                                            edit_ttype = st.selectbox("批注类型", ANNOTATION_TYPES, 
+                                                                       index=ANNOTATION_TYPES.index(t["annotation_type"]), 
+                                                                       key=f"edit_ttype_{t['id']}")
+                                        with col_e2:
+                                            edit_tprio = st.selectbox("优先级", ANNOTATION_PRIORITIES,
+                                                                       index=ANNOTATION_PRIORITIES.index(t["priority"]),
+                                                                       key=f"edit_tprio_{t['id']}")
+                                            edit_tpublic = st.checkbox("设为公共模板", value=bool(t["is_public"]),
+                                                                        key=f"edit_tpublic_{t['id']}")
+                                        
+                                        edit_tcontent = st.text_area("批注内容", value=t["content"], height=80,
+                                                                      key=f"edit_tcontent_{t['id']}")
+                                        
+                                        col_se, col_ce = st.columns(2)
+                                        with col_se:
+                                            save_edit = st.form_submit_button("保存修改", type="primary", use_container_width=True)
+                                        with col_ce:
+                                            cancel_edit = st.form_submit_button("取消", use_container_width=True)
+                                        
+                                        if save_edit:
+                                            if not edit_tname.strip() or not edit_tcontent.strip():
+                                                st.error("模板名称和内容不能为空")
+                                            else:
+                                                try:
+                                                    update_annotation_template(
+                                                        t["id"],
+                                                        name=edit_tname.strip(),
+                                                        content=edit_tcontent.strip(),
+                                                        annotation_type=edit_ttype,
+                                                        priority=edit_tprio,
+                                                        is_public=edit_tpublic
+                                                    )
+                                                    st.success("✅ 模板已更新")
+                                                    st.session_state[f"editing_template_{t['id']}"] = False
+                                                    st.rerun()
+                                                except Exception as e:
+                                                    st.error(str(e))
+                                        if cancel_edit:
+                                            st.session_state[f"editing_template_{t['id']}"] = False
+                                            st.rerun()
 
     st.divider()
     st.info("💡 **角色说明**：\n\n- **初审员**：批准权重为1\n- **高级审阅员**：批准权重为2（相当于2个初审员）\n- **主管**：直接通过，无需其他人批准\n\n**审批规则**：\n- 任一审阅人退回 → 报告立即退回\n- 主管批准 → 报告立即通过\n- 批准权重总和 >= max(审阅人数, 2) → 报告通过")

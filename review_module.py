@@ -1,15 +1,16 @@
 import json
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from db import get_db
 from config_manager import get_active_config
 
 REVIEWER_ROLES = ["初审员", "高级审阅员", "主管"]
 ROLE_WEIGHTS = {"初审员": 1, "高级审阅员": 2, "主管": 999}
-REPORT_STATUSES = ["草稿", "审阅中", "已批准", "已退回"]
+REPORT_STATUSES = ["草稿", "审阅中", "已批准", "已退回", "已超时"]
 ANNOTATION_TYPES = ["疑问", "建议", "反对", "确认"]
+ANNOTATION_PRIORITIES = ["紧急", "普通", "低"]
 ANNOTATION_STATUSES = ["开放", "已解决"]
-REVIEW_ACTIONS = ["提交审阅", "批准", "退回", "请求修改"]
+REVIEW_ACTIONS = ["提交审阅", "批准", "退回", "请求修改", "延期", "强制关闭"]
 
 
 def init_review_tables():
@@ -29,15 +30,17 @@ def init_review_tables():
             generation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             generation_params TEXT,
             file_path TEXT,
-            status TEXT NOT NULL DEFAULT '草稿' CHECK(status IN ('草稿','审阅中','已批准','已退回')),
+            status TEXT NOT NULL DEFAULT '草稿' CHECK(status IN ('草稿','审阅中','已批准','已退回','已超时')),
             submitter TEXT,
             submitted_at TIMESTAMP,
+            deadline TIMESTAMP,
             reject_reason TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_report_status ON report_versions(status);
         CREATE INDEX IF NOT EXISTS idx_report_version ON report_versions(version_number);
+        CREATE INDEX IF NOT EXISTS idx_report_deadline ON report_versions(deadline);
 
         CREATE TABLE IF NOT EXISTS report_signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,7 +79,7 @@ def init_review_tables():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             report_version_id INTEGER NOT NULL,
             reviewer_id INTEGER,
-            action TEXT NOT NULL CHECK(action IN ('提交审阅','批准','退回','请求修改')),
+            action TEXT NOT NULL CHECK(action IN ('提交审阅','批准','退回','请求修改','延期','强制关闭')),
             comments TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (report_version_id) REFERENCES report_versions(id),
@@ -92,6 +95,7 @@ def init_review_tables():
             signal_id INTEGER NOT NULL,
             content TEXT NOT NULL,
             annotation_type TEXT NOT NULL CHECK(annotation_type IN ('疑问','建议','反对','确认')),
+            priority TEXT NOT NULL DEFAULT '普通' CHECK(priority IN ('紧急','普通','低')),
             author_id INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT '开放' CHECK(status IN ('开放','已解决')),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -102,6 +106,7 @@ def init_review_tables():
         CREATE INDEX IF NOT EXISTS idx_ann_report ON annotations(report_version_id);
         CREATE INDEX IF NOT EXISTS idx_ann_signal ON annotations(signal_id);
         CREATE INDEX IF NOT EXISTS idx_ann_status ON annotations(status);
+        CREATE INDEX IF NOT EXISTS idx_ann_priority ON annotations(priority);
 
         CREATE TABLE IF NOT EXISTS annotation_replies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,7 +119,31 @@ def init_review_tables():
         );
 
         CREATE INDEX IF NOT EXISTS idx_ar_annotation ON annotation_replies(annotation_id);
+
+        CREATE TABLE IF NOT EXISTS annotation_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            content TEXT NOT NULL,
+            annotation_type TEXT NOT NULL CHECK(annotation_type IN ('疑问','建议','反对','确认')),
+            priority TEXT NOT NULL DEFAULT '普通' CHECK(priority IN ('紧急','普通','低')),
+            is_public INTEGER NOT NULL DEFAULT 0,
+            creator_id INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (creator_id) REFERENCES reviewers(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_at_creator ON annotation_templates(creator_id);
+        CREATE INDEX IF NOT EXISTS idx_at_public ON annotation_templates(is_public);
         """)
+        
+        try:
+            conn.execute("ALTER TABLE report_versions ADD COLUMN deadline TIMESTAMP")
+        except:
+            pass
+        try:
+            conn.execute("ALTER TABLE annotations ADD COLUMN priority TEXT NOT NULL DEFAULT '普通' CHECK(priority IN ('紧急','普通','低'))")
+        except:
+            pass
 
 
 def create_default_reviewers():
@@ -324,9 +353,11 @@ def compare_report_versions(version1_id, version2_id):
     return changes
 
 
-def submit_for_review(report_version_id, reviewer_ids, submitter_name=None):
+def submit_for_review(report_version_id, reviewer_ids, deadline, submitter_name=None):
     if not reviewer_ids:
         raise ValueError("至少需要指定一位审阅人")
+    if not deadline:
+        raise ValueError("必须设置审阅截止时间")
 
     with get_db() as conn:
         report = conn.execute(
@@ -341,10 +372,10 @@ def submit_for_review(report_version_id, reviewer_ids, submitter_name=None):
         conn.execute(
             """
             UPDATE report_versions 
-            SET status = '审阅中', submitter = ?, submitted_at = CURRENT_TIMESTAMP
+            SET status = '审阅中', submitter = ?, submitted_at = CURRENT_TIMESTAMP, deadline = ?
             WHERE id = ?
             """,
-            (submitter_name, report_version_id),
+            (submitter_name, deadline, report_version_id),
         )
 
         for reviewer_id in reviewer_ids:
@@ -361,7 +392,130 @@ def submit_for_review(report_version_id, reviewer_ids, submitter_name=None):
             INSERT INTO review_history (report_version_id, action, comments)
             VALUES (?, '提交审阅', ?)
             """,
-            (report_version_id, f"指定审阅人: {len(reviewer_ids)}人"),
+            (report_version_id, f"指定审阅人: {len(reviewer_ids)}人, 截止时间: {deadline}"),
+        )
+
+
+def check_and_update_timeout():
+    with get_db() as conn:
+        now = datetime.now()
+        rows = conn.execute(
+            """
+            SELECT * FROM report_versions 
+            WHERE status = '审阅中' AND deadline IS NOT NULL AND deadline < ?
+            """,
+            (now.strftime("%Y-%m-%d %H:%M:%S"),),
+        ).fetchall()
+        
+        timeout_count = 0
+        for r in rows:
+            conn.execute(
+                "UPDATE report_versions SET status = '已超时' WHERE id = ?",
+                (r["id"],),
+            )
+            conn.execute(
+                """
+                INSERT INTO review_history (report_version_id, action, comments)
+                VALUES (?, '提交审阅', ?)
+                """,
+                (r["id"], "系统自动标记为已超时"),
+            )
+            timeout_count += 1
+        return timeout_count
+
+
+def get_remaining_time(report_version_id):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT deadline, status FROM report_versions WHERE id = ?",
+            (report_version_id,),
+        ).fetchone()
+        if not row or not row["deadline"]:
+            return None, None
+        
+        deadline = datetime.strptime(row["deadline"], "%Y-%m-%d %H:%M:%S")
+        now = datetime.now()
+        remaining = deadline - now
+        
+        if remaining.total_seconds() <= 0:
+            return "已超时", 0
+        
+        days = remaining.days
+        hours = remaining.seconds // 3600
+        minutes = (remaining.seconds % 3600) // 60
+        
+        if days > 0:
+            display = f"剩余 {days}天 {hours}小时"
+        elif hours > 0:
+            display = f"剩余 {hours}小时 {minutes}分钟"
+        else:
+            display = f"剩余 {minutes}分钟"
+        
+        is_urgent = remaining.total_seconds() < 24 * 3600
+        
+        return display, remaining.total_seconds()
+
+
+def extend_deadline(report_version_id, new_deadline, operator_id=None):
+    with get_db() as conn:
+        report = conn.execute(
+            "SELECT * FROM report_versions WHERE id = ?",
+            (report_version_id,),
+        ).fetchone()
+        if not report:
+            raise ValueError("报告不存在")
+        if report["status"] != "已超时":
+            raise ValueError("只有已超时的报告才能延期")
+        
+        conn.execute(
+            """
+            UPDATE report_versions 
+            SET status = '审阅中', deadline = ?
+            WHERE id = ?
+            """,
+            (new_deadline, report_version_id),
+        )
+        
+        conn.execute(
+            """
+            INSERT INTO review_history (report_version_id, reviewer_id, action, comments)
+            VALUES (?, ?, '延期', ?)
+            """,
+            (report_version_id, operator_id, f"延期至: {new_deadline}"),
+        )
+        
+        conn.execute(
+            "UPDATE review_assignments SET decision = NULL, completed_at = NULL WHERE report_version_id = ?",
+            (report_version_id,),
+        )
+
+
+def force_close(report_version_id, operator_id=None):
+    with get_db() as conn:
+        report = conn.execute(
+            "SELECT * FROM report_versions WHERE id = ?",
+            (report_version_id,),
+        ).fetchone()
+        if not report:
+            raise ValueError("报告不存在")
+        if report["status"] != "已超时":
+            raise ValueError("只有已超时的报告才能强制关闭")
+        
+        conn.execute(
+            """
+            UPDATE report_versions 
+            SET status = '已退回', reject_reason = '超时未完成审阅，已强制关闭'
+            WHERE id = ?
+            """,
+            (report_version_id,),
+        )
+        
+        conn.execute(
+            """
+            INSERT INTO review_history (report_version_id, reviewer_id, action, comments)
+            VALUES (?, ?, '强制关闭', '超时未完成审阅，已强制关闭')
+            """,
+            (report_version_id, operator_id),
         )
 
 
@@ -406,6 +560,8 @@ def make_review_decision(report_version_id, reviewer_id, decision, comments=None
         ).fetchone()
         if not report:
             raise ValueError("报告不存在")
+        if report["status"] == "已超时":
+            raise ValueError("报告已超时，无法进行审批操作")
         if report["status"] != "审阅中":
             raise ValueError("只有审阅中的报告才能进行审批操作")
 
@@ -530,17 +686,19 @@ def get_review_history(report_version_id):
         return [dict(r) for r in rows]
 
 
-def add_annotation(report_version_id, signal_id, content, annotation_type, author_id):
+def add_annotation(report_version_id, signal_id, content, annotation_type, author_id, priority="普通"):
     if annotation_type not in ANNOTATION_TYPES:
         raise ValueError(f"无效批注类型: {annotation_type}")
+    if priority not in ANNOTATION_PRIORITIES:
+        raise ValueError(f"无效优先级: {priority}")
     with get_db() as conn:
         cursor = conn.execute(
             """
             INSERT INTO annotations
-            (report_version_id, signal_id, content, annotation_type, author_id)
-            VALUES (?, ?, ?, ?, ?)
+            (report_version_id, signal_id, content, annotation_type, priority, author_id)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (report_version_id, signal_id, content, annotation_type, author_id),
+            (report_version_id, signal_id, content, annotation_type, priority, author_id),
         )
         return cursor.lastrowid
 
@@ -568,7 +726,7 @@ def set_annotation_status(annotation_id, status):
         )
 
 
-def get_annotations(report_version_id, signal_id=None, status=None):
+def get_annotations(report_version_id, signal_id=None, status=None, priority=None):
     with get_db() as conn:
         query = """
             SELECT a.*, r.name as author_name, r.role as author_role
@@ -583,6 +741,9 @@ def get_annotations(report_version_id, signal_id=None, status=None):
         if status:
             query += " AND a.status = ?"
             params.append(status)
+        if priority:
+            query += " AND a.priority = ?"
+            params.append(priority)
         query += " ORDER BY a.created_at DESC"
         rows = conn.execute(query, params).fetchall()
         annotations = [dict(r) for r in rows]
@@ -617,9 +778,279 @@ def get_annotation_count_by_signal(report_version_id):
         return {r["signal_id"]: r["cnt"] for r in rows}
 
 
+def create_annotation_template(name, content, annotation_type, priority, is_public, creator_id):
+    if annotation_type not in ANNOTATION_TYPES:
+        raise ValueError(f"无效批注类型: {annotation_type}")
+    if priority not in ANNOTATION_PRIORITIES:
+        raise ValueError(f"无效优先级: {priority}")
+    with get_db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO annotation_templates
+            (name, content, annotation_type, priority, is_public, creator_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (name, content, annotation_type, priority, 1 if is_public else 0, creator_id),
+        )
+        return cursor.lastrowid
+
+
+def update_annotation_template(template_id, name=None, content=None, annotation_type=None, priority=None, is_public=None):
+    fields = []
+    values = []
+    if name:
+        fields.append("name = ?")
+        values.append(name)
+    if content:
+        fields.append("content = ?")
+        values.append(content)
+    if annotation_type:
+        if annotation_type not in ANNOTATION_TYPES:
+            raise ValueError(f"无效批注类型: {annotation_type}")
+        fields.append("annotation_type = ?")
+        values.append(annotation_type)
+    if priority:
+        if priority not in ANNOTATION_PRIORITIES:
+            raise ValueError(f"无效优先级: {priority}")
+        fields.append("priority = ?")
+        values.append(priority)
+    if is_public is not None:
+        fields.append("is_public = ?")
+        values.append(1 if is_public else 0)
+    values.append(template_id)
+    with get_db() as conn:
+        conn.execute(
+            f"UPDATE annotation_templates SET {', '.join(fields)} WHERE id = ?",
+            tuple(values),
+        )
+
+
+def delete_annotation_template(template_id):
+    with get_db() as conn:
+        conn.execute("DELETE FROM annotation_templates WHERE id = ?", (template_id,))
+
+
+def get_annotation_templates(user_id=None):
+    with get_db() as conn:
+        query = """
+            SELECT at.*, r.name as creator_name
+            FROM annotation_templates at
+            JOIN reviewers r ON at.creator_id = r.id
+            WHERE at.is_public = 1
+        """
+        params = []
+        if user_id:
+            query += " OR at.creator_id = ?"
+            params.append(user_id)
+        query += " ORDER BY at.is_public DESC, at.created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_my_todo_list(reviewer_id):
+    with get_db() as conn:
+        priority_order = {"紧急": 0, "普通": 1, "低": 2}
+        
+        pending_reviews = conn.execute(
+            """
+            SELECT ra.*, rv.version_number, rv.status as report_status,
+                   rs.device_name, rs.event_type
+            FROM review_assignments ra
+            JOIN report_versions rv ON ra.report_version_id = rv.id
+            LEFT JOIN report_signals rs ON rs.report_version_id = rv.id
+            WHERE ra.reviewer_id = ? AND ra.decision IS NULL
+            AND rv.status IN ('审阅中', '已超时')
+            ORDER BY rv.deadline ASC
+            """,
+            (reviewer_id,),
+        ).fetchall()
+        
+        urgent_annotations = conn.execute(
+            """
+            SELECT a.*, rv.version_number, 
+                   rs.device_name, rs.event_type,
+                   r.name as author_name
+            FROM annotations a
+            JOIN report_versions rv ON a.report_version_id = rv.id
+            JOIN report_signals rs ON a.signal_id = rs.id AND a.report_version_id = rs.report_version_id
+            JOIN reviewers r ON a.author_id = r.id
+            WHERE a.priority = '紧急' AND a.status = '开放'
+            AND rv.status IN ('审阅中', '已超时')
+            ORDER BY a.created_at DESC
+            """,
+            (),
+        ).fetchall()
+        
+        todo_list = []
+        for r in pending_reviews:
+            remaining, seconds = get_remaining_time(r["report_version_id"])
+            todo_list.append({
+                "type": "review",
+                "id": r["id"],
+                "report_version_id": r["report_version_id"],
+                "version_number": r["version_number"],
+                "device_name": r["device_name"],
+                "event_type": r["event_type"],
+                "priority": "紧急" if seconds and seconds < 24 * 3600 else "普通",
+                "remaining_time": remaining,
+                "report_status": r["report_status"],
+                "signal_id": None,
+                "annotation_id": None,
+            })
+        
+        for a in urgent_annotations:
+            todo_list.append({
+                "type": "annotation",
+                "id": a["id"],
+                "report_version_id": a["report_version_id"],
+                "version_number": a["version_number"],
+                "device_name": a["device_name"],
+                "event_type": a["event_type"],
+                "priority": a["priority"],
+                "content": a["content"],
+                "author_name": a["author_name"],
+                "annotation_type": a["annotation_type"],
+                "signal_id": a["signal_id"],
+                "annotation_id": a["id"],
+            })
+        
+        todo_list.sort(key=lambda x: priority_order.get(x["priority"], 3))
+        return todo_list
+
+
+def compare_report_versions_enhanced(version1_id, version2_id):
+    base_changes = compare_report_versions(version1_id, version2_id)
+    
+    all_report_versions = get_all_report_versions()
+    version_numbers = sorted([v["version_number"] for v in all_report_versions])
+    
+    v1 = get_report_version(version1_id)
+    v2 = get_report_version(version2_id)
+    
+    for change in base_changes:
+        key = f"{change['device_name']}|{change['event_type']}"
+        
+        old_signal = change.get("old_signal")
+        new_signal = change.get("new_signal")
+        
+        prr_change = None
+        ror_change = None
+        ic_change = None
+        ebgm_change = None
+        
+        if old_signal and new_signal:
+            if old_signal.get("prr_value") and new_signal.get("prr_value"):
+                diff = new_signal["prr_value"] - old_signal["prr_value"]
+                prr_change = {
+                    "old": round(old_signal["prr_value"], 3),
+                    "new": round(new_signal["prr_value"], 3),
+                    "diff": round(diff, 3),
+                    "direction": "up" if diff > 0 else "down" if diff < 0 else "same"
+                }
+            if old_signal.get("ror_value") and new_signal.get("ror_value"):
+                diff = new_signal["ror_value"] - old_signal["ror_value"]
+                ror_change = {
+                    "old": round(old_signal["ror_value"], 3),
+                    "new": round(new_signal["ror_value"], 3),
+                    "diff": round(diff, 3),
+                    "direction": "up" if diff > 0 else "down" if diff < 0 else "same"
+                }
+            if old_signal.get("ic_value") and new_signal.get("ic_value"):
+                diff = new_signal["ic_value"] - old_signal["ic_value"]
+                ic_change = {
+                    "old": round(old_signal["ic_value"], 3),
+                    "new": round(new_signal["ic_value"], 3),
+                    "diff": round(diff, 3),
+                    "direction": "up" if diff > 0 else "down" if diff < 0 else "same"
+                }
+            if old_signal.get("ebgm_value") and new_signal.get("ebgm_value"):
+                diff = new_signal["ebgm_value"] - old_signal["ebgm_value"]
+                ebgm_change = {
+                    "old": round(old_signal["ebgm_value"], 3),
+                    "new": round(new_signal["ebgm_value"], 3),
+                    "diff": round(diff, 3),
+                    "direction": "up" if diff > 0 else "down" if diff < 0 else "same"
+                }
+        
+        change["prr_change"] = prr_change
+        change["ror_change"] = ror_change
+        change["ic_change"] = ic_change
+        change["ebgm_change"] = ebgm_change
+        
+        trend_data = []
+        for v in all_report_versions:
+            signals = get_report_signals(v["id"])
+            for s in signals:
+                if s["device_name"] == change["device_name"] and s["event_type"] == change["event_type"]:
+                    strength_order = {"无信号": 0, "弱信号": 1, "中等信号": 2, "强信号": 3}
+                    trend_data.append({
+                        "version_number": v["version_number"],
+                        "signal_strength": s["signal_strength"],
+                        "strength_value": strength_order.get(s["signal_strength"], 0),
+                        "prr_value": s.get("prr_value"),
+                    })
+                    break
+        
+        trend_data.sort(key=lambda x: x["version_number"])
+        if len(trend_data) > 5:
+            trend_data = trend_data[-5:]
+        change["trend_data"] = trend_data
+    
+    return base_changes
+
+
+def export_review_comments(report_version_id):
+    report = get_report_version(report_version_id)
+    if not report:
+        raise ValueError("报告不存在")
+    
+    annotations = get_annotations(report_version_id)
+    history = get_review_history(report_version_id)
+    
+    import csv
+    import io
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    writer.writerow(["=== 批注信息 ==="])
+    writer.writerow(["信号名称", "批注内容", "批注类型", "优先级", "批注人", "批注时间", "状态", "回复数量"])
+    
+    signals = {s["id"]: f"{s['device_name']} - {s['event_type']}" for s in report.get("signals", [])}
+    
+    for ann in annotations:
+        signal_name = signals.get(ann["signal_id"], f"信号{ann['signal_id']}")
+        writer.writerow([
+            signal_name,
+            ann["content"],
+            ann["annotation_type"],
+            ann.get("priority", "普通"),
+            ann["author_name"],
+            ann["created_at"],
+            ann["status"],
+            len(ann.get("replies", [])),
+        ])
+    
+    writer.writerow([])
+    writer.writerow(["=== 审阅历史 ==="])
+    writer.writerow(["操作时间", "操作人", "操作类型", "意见内容"])
+    
+    for h in history:
+        writer.writerow([
+            h["created_at"],
+            h.get("reviewer_name", "系统"),
+            h["action"],
+            h.get("comments", ""),
+        ])
+    
+    return output.getvalue()
+
+
 def get_review_statistics():
     with get_db() as conn:
         stats = {}
+        
+        check_and_update_timeout()
 
         approved_reports = conn.execute(
             """
@@ -657,6 +1088,12 @@ def get_review_statistics():
             "SELECT COUNT(*) as cnt FROM review_history WHERE action = '退回'"
         ).fetchone()["cnt"]
         stats["reject_rate"] = round(reject_count / submit_count * 100, 2) if submit_count > 0 else 0
+        
+        timeout_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM report_versions WHERE status = '已超时'"
+        ).fetchone()["cnt"]
+        stats["timeout_count"] = timeout_count
+        stats["timeout_rate"] = round(timeout_count / submit_count * 100, 2) if submit_count > 0 else 0
 
         top_signals = conn.execute(
             """
@@ -684,14 +1121,21 @@ def get_review_statistics():
 
 def get_kanban_data():
     with get_db() as conn:
+        check_and_update_timeout()
+        
         reports = conn.execute(
             "SELECT * FROM report_versions ORDER BY version_number DESC"
         ).fetchall()
 
-        kanban = {"草稿": [], "审阅中": [], "已批准": [], "已退回": []}
+        kanban = {"草稿": [], "审阅中": [], "已批准": [], "已退回": [], "已超时": []}
 
         for r in reports:
             report_dict = dict(r)
+            
+            remaining, seconds = get_remaining_time(r["id"])
+            report_dict["remaining_time"] = remaining
+            report_dict["remaining_seconds"] = seconds
+            report_dict["is_urgent"] = seconds and seconds < 24 * 3600 and seconds > 0
 
             signal_count = conn.execute(
                 "SELECT COUNT(*) as cnt FROM report_signals WHERE report_version_id = ?",
