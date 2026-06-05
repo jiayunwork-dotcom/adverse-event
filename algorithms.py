@@ -166,9 +166,11 @@ def compute_mgps(a, b, c, d):
     EBGM = p1 * ebgm1 + p2 * ebgm2
 
     n_sim = 10000
-    comp1 = np.random.gamma(post_alpha1, 1.0 / post_beta1, n_sim)
-    comp2 = np.random.gamma(post_alpha2, 1.0 / post_beta2, n_sim)
-    mask = np.random.random(n_sim) < p1
+    seed = int((a + b + c + d) * 1000) % (2**31 - 1)
+    rng = np.random.default_rng(seed)
+    comp1 = rng.gamma(post_alpha1, 1.0 / post_beta1, n_sim)
+    comp2 = rng.gamma(post_alpha2, 1.0 / post_beta2, n_sim)
+    mask = rng.random(n_sim) < p1
     samples = np.where(mask, comp1, comp2)
     EB05 = np.percentile(samples, 10)
 

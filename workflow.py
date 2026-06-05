@@ -19,7 +19,8 @@ def get_all_signal_workflow():
             SELECT sw.*, s.device_name, s.event_type, s.signal_strength, s.report_count
             FROM signal_workflow sw
             JOIN signals s ON sw.signal_id = s.id
-            WHERE sw.id IN (
+            WHERE s.signal_strength != '无信号'
+              AND sw.id IN (
                 SELECT MAX(id) FROM signal_workflow GROUP BY signal_id
             )
             ORDER BY
@@ -37,7 +38,9 @@ def get_all_signal_workflow():
 
 def init_workflow_for_signals():
     with get_db() as conn:
-        signals = conn.execute("SELECT id FROM signals").fetchall()
+        signals = conn.execute(
+            "SELECT id FROM signals WHERE signal_strength != '无信号'"
+        ).fetchall()
         existing = conn.execute("SELECT DISTINCT signal_id FROM signal_workflow").fetchall()
         existing_ids = {r["signal_id"] for r in existing}
         for s in signals:
@@ -76,7 +79,9 @@ def set_action_measure(signal_id, action_measure, operator="分析员", notes=""
 
 def get_kanban_data():
     with get_db() as conn:
-        signals = conn.execute("SELECT * FROM signals").fetchall()
+        signals = conn.execute(
+            "SELECT * FROM signals WHERE signal_strength != '无信号'"
+        ).fetchall()
         signal_map = {s["id"]: dict(s) for s in signals}
 
         workflows = conn.execute(

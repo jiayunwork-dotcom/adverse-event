@@ -10,6 +10,7 @@ from db import init_db, get_db
 from data_import import (
     validate_dataframe, rename_columns, check_duplicates,
     import_data, load_reports, get_report_stats, get_distinct_values,
+    COLUMN_DESCRIPTIONS,
 )
 from algorithms import run_signal_detection, save_signals, load_signals, get_signal_detail, build_contingency_table
 from correction import apply_corrections, get_corrected_signal_strength
@@ -89,6 +90,12 @@ def page_overview():
 
 def page_import():
     st.title("📥 数据导入")
+
+    with st.expander("📋 字段说明（点击展开）", expanded=False):
+        col_desc = [{"字段名称": col, "说明": desc} for col, desc in COLUMN_DESCRIPTIONS.items()]
+        st.table(pd.DataFrame(col_desc))
+        st.info("💡 **提示**：'器械分类编码'是进行同类器械对比的必需字段。该编码应采用国家医疗器械分类编码标准，系统会自动取编码前4位识别同品类器械。")
+
     uploaded_file = st.file_uploader("上传不良事件报告数据", type=["csv", "xlsx", "xls"])
 
     if uploaded_file is not None:
@@ -448,8 +455,33 @@ def page_similar():
         return
 
     devices_with_code = df[df["device_class_code"].notna()]["device_name"].unique().tolist()
+
     if not devices_with_code:
-        st.warning("数据中缺少器械分类编码，无法进行同类对比。请确保导入数据包含'器械分类编码'列。")
+        st.error("🔴 当前数据中缺少'器械分类编码'字段，无法进行同类对比")
+        st.info("""
+        **关于器械分类编码：**
+        
+        器械分类编码是国家医疗器械分类标准编码（如YY/T 0468或NMPA分类编码），用于：
+        - 精确识别同品类器械
+        - 编码前4位相同的器械视为同品类
+        - 同类对比功能依赖此字段
+        
+        **解决方法：**
+        1. 在导入的CSV/Excel文件中添加'器械分类编码'列
+        2. 参考国家医疗器械分类数据库获取正确编码
+        3. 重新导入数据后即可使用本功能
+        
+        💡 可在'数据导入'页面查看完整字段说明
+        """)
+
+        st.subheader("当前已导入器械列表")
+        all_devices = df["device_name"].unique().tolist()
+        device_df = pd.DataFrame({
+            "器械名称": all_devices,
+            "报告数": [len(df[df["device_name"] == d]) for d in all_devices],
+            "是否有分类编码": ["❌ 缺失" for _ in all_devices],
+        })
+        st.dataframe(device_df, use_container_width=True)
         return
 
     selected = st.selectbox("选择器械", devices_with_code)
@@ -495,9 +527,24 @@ def page_kanban():
 
     kanban = get_kanban_data()
 
+    col_op, col_note = st.columns([1, 3])
+    with col_op:
+        operator = st.text_input("当前操作人", value="分析员", key="kanban_operator")
+    with col_note:
+        batch_note = st.text_input("批量备注（可留空）", key="kanban_batch_note", placeholder="可填写批量操作的备注说明")
+
+    st.divider()
+
     status_cols = st.columns(4)
     status_names = ["待评估", "评估中", "确认信号", "排除"]
     status_colors = ["#FFA500", "#1E90FF", "#32CD32", "#808080"]
+
+    quick_actions = {
+        "待评估": [("→ 评估中", "评估中", "#1E90FF"), ("→ 排除", "排除", "#808080")],
+        "评估中": [("→ 确认信号", "确认信号", "#32CD32"), ("→ 排除", "排除", "#808080"), ("← 返回待评估", "待评估", "#FFA500")],
+        "确认信号": [("← 返回评估中", "评估中", "#1E90FF"), ("→ 排除", "排除", "#808080")],
+        "排除": [("← 恢复待评估", "待评估", "#FFA500")],
+    }
 
     for i, (status, color) in enumerate(zip(status_names, status_colors)):
         with status_cols[i]:
@@ -505,62 +552,75 @@ def page_kanban():
             st.markdown(f"<h3 style='color:{color};text-align:center;'>{status} ({len(items)})</h3>", unsafe_allow_html=True)
             st.divider()
 
-            for item in items:
+            for idx, item in enumerate(items):
                 strength_color = {"强信号": "#d62728", "中等信号": "#ff7f0e", "弱信号": "#2ca02c", "无信号": "#999"}
                 sc = strength_color.get(item.get("signal_strength", ""), "#999")
+                item_id = item.get("id", f"{item['device_name']}_{item['event_type']}_{idx}")
+
                 with st.container(border=True):
-                    st.markdown(f"**{item.get('device_name', 'N/A')}**")
-                    st.markdown(f"事件: {item.get('event_type', 'N/A')}")
-                    st.markdown(f"<span style='color:{sc};font-weight:bold;'>{item.get('signal_strength', 'N/A')}</span>", unsafe_allow_html=True)
-                    st.caption(f"报告数: {item.get('report_count', 0)}")
+                    col_info, col_actions = st.columns([3, 2])
+                    with col_info:
+                        st.markdown(f"**{item.get('device_name', 'N/A')}**")
+                        st.markdown(f"📌 {item.get('event_type', 'N/A')}")
+                        st.markdown(f"<span style='color:{sc};font-weight:bold;'>{item.get('signal_strength', 'N/A')}</span>", unsafe_allow_html=True)
+                        st.caption(f"📊 报告数: {item.get('report_count', 0)} | ID: {item.get('id', 'N/A')}")
 
-                    available_next = []
-                    if status == "待评估":
-                        available_next = ["评估中", "排除"]
-                    elif status == "评估中":
-                        available_next = ["确认信号", "排除"]
-                    elif status == "排除":
-                        available_next = ["待评估"]
-
-                    if available_next:
-                        new_status = st.selectbox(
-                            "变更状态",
-                            available_next,
-                            key=f"status_{item.get('id', hash(str(item)))}",
-                        )
-                        operator = st.text_input("操作人", value="分析员", key=f"op_{item.get('id', hash(str(item)))}")
-                        notes = st.text_input("备注", key=f"notes_{item.get('id', hash(str(item)))}")
-
-                        if st.button("确认变更", key=f"btn_{item.get('id', hash(str(item)))}"):
-                            try:
-                                update_signal_status(item["id"], new_status, operator, notes)
-                                st.success(f"已变更为: {new_status}")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(str(e))
+                    with col_actions:
+                        st.caption("**快捷操作**")
+                        for label, target, btn_color in quick_actions.get(status, []):
+                            btn_key = f"quick_{item_id}_{target}"
+                            if st.button(label, key=btn_key, use_container_width=True, type="secondary"):
+                                try:
+                                    notes = batch_note if batch_note else f"从{status}变更为{target}"
+                                    update_signal_status(item["id"], target, operator, notes)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(str(e))
 
                     if status == "确认信号":
-                        action = st.selectbox(
-                            "行动措施",
-                            ["继续监测", "发布安全警示", "召回", "修改说明书"],
-                            key=f"action_{item.get('id', hash(str(item)))}",
-                        )
-                        if st.button("设置措施", key=f"act_btn_{item.get('id', hash(str(item)))}"):
-                            try:
-                                set_action_measure(item["id"], action)
-                                st.success(f"已设置行动措施: {action}")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(str(e))
+                        st.divider()
+                        col_act, col_btn = st.columns([2, 1])
+                        with col_act:
+                            action = st.selectbox(
+                                "行动措施",
+                                ["继续监测", "发布安全警示", "召回", "修改说明书"],
+                                key=f"action_select_{item_id}",
+                            )
+                        with col_btn:
+                            st.write("")
+                            if st.button("设置", key=f"act_btn_{item_id}", type="primary"):
+                                try:
+                                    notes = f"设置行动措施: {action}"
+                                    set_action_measure(item["id"], action, operator, notes)
+                                    st.success(f"✅ 已设置: {action}")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(str(e))
 
-    st.subheader("信号详情查询")
+                    if item.get("action_measure"):
+                        st.caption(f"🛠️ 行动措施: **{item.get('action_measure', '')}**")
+
+                st.write("")
+
+    st.divider()
+    st.subheader("📋 信号详情查询")
     signal_id = st.number_input("输入信号ID", min_value=1, step=1)
     if st.button("查询详情"):
         detail = get_signal_with_workflow(signal_id)
         if detail:
-            st.json(detail)
+            st.markdown("### 信号基本信息")
+            st.json(detail["signal"])
+            st.markdown("### 操作历史")
+            history_df = pd.DataFrame(detail["workflow_history"])
+            if not history_df.empty:
+                history_df = history_df[["created_at", "operator", "status", "notes", "action_measure"]]
+                history_df.columns = ["操作时间", "操作人", "状态", "备注", "行动措施"]
+                st.dataframe(history_df, use_container_width=True)
         else:
             st.warning("未找到该信号")
+
+    st.divider()
+    st.caption("💡 使用提示：点击卡片右侧的快捷按钮可快速变更状态，无需额外确认。看板已自动过滤'无信号'的条目。")
 
 
 def page_export():
