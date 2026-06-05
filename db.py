@@ -27,6 +27,9 @@ def get_db():
 
 
 def init_db():
+    from review_module import init_review_tables, create_default_reviewers
+    init_review_tables()
+    create_default_reviewers()
     with get_db() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS reports (

@@ -1,6 +1,7 @@
 import io
 import os
 import tempfile
+import json
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -19,6 +20,8 @@ from db import get_db
 from data_import import get_report_stats
 from algorithms import load_signals
 from workflow import get_kanban_data
+from review_module import create_report_version
+from config_manager import get_active_config
 
 
 def _register_chinese_font():
@@ -57,7 +60,7 @@ def _make_time_trend_fig(df, device_name):
     return fig
 
 
-def generate_pdf_report(date_range=None):
+def generate_pdf_report(date_range=None, submitter=None, create_version=True):
     font_name = _register_chinese_font()
     stats = get_report_stats()
     signals_df = load_signals()
@@ -201,4 +204,22 @@ def generate_pdf_report(date_range=None):
         elements.append(a_tbl)
 
     doc.build(elements)
-    return pdf_path
+
+    if create_version and not signals_df.empty:
+        config = get_active_config()
+        generation_params = {
+            "detection_config": config,
+            "date_range": date_range,
+            "filters": {},
+            "stats_summary": {
+                "total_reports": stats.get("total_reports", 0),
+                "total_devices": stats.get("total_devices", 0),
+                "total_event_types": stats.get("total_event_types", 0),
+            }
+        }
+        report_version_id, version_number = create_report_version(
+            signals_df, pdf_path, generation_params, submitter
+        )
+        return pdf_path, report_version_id, version_number
+
+    return pdf_path, None, None
