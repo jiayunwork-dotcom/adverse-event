@@ -5,6 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import os
 import tempfile
+import json
 from datetime import datetime
 
 from db import init_db, get_db
@@ -53,7 +54,13 @@ from risk_assessment import (
     get_risk_level_counts, get_upgrade_alerts,
     generate_comparison_summary,
     RISK_LEVELS, get_risk_level, get_risk_level_info,
+    generate_risk_alerts, get_active_risk_alerts,
+    confirm_risk_alert, calculate_simulated_score,
+    get_simulated_rank, save_simulator_scheme,
+    get_simulator_schemes, delete_simulator_scheme,
+    get_risk_scores_for_export,
 )
+from config_manager import get_risk_weights, DEFAULT_WEIGHTS, get_alert_config
 
 st.set_page_config(page_title="医疗器械不良事件信号检测平台", layout="wide", page_icon="🔬")
 
@@ -82,6 +89,14 @@ if "risk_compare_devices" not in st.session_state:
     st.session_state.risk_compare_devices = []
 if "risk_page_tab" not in st.session_state:
     st.session_state.risk_page_tab = "风险排行看板"
+if "simulator_signal" not in st.session_state:
+    st.session_state.simulator_signal = 50
+if "simulator_frequency" not in st.session_state:
+    st.session_state.simulator_frequency = 50
+if "simulator_severity" not in st.session_state:
+    st.session_state.simulator_severity = 50
+if "simulator_trend" not in st.session_state:
+    st.session_state.simulator_trend = 50
 
 if st.session_state.selected_report_for_detail is not None:
     default_page = "📝 报告审阅"
@@ -324,10 +339,12 @@ def page_detection():
                     generate_alerts(result_df, detection_run_id)
 
                     with st.spinner("正在计算风险评分..."):
-                        calculate_all_risk_scores(detection_run_id)
+                        risk_results = calculate_all_risk_scores(detection_run_id)
                         st.session_state.risk_scores_df = load_risk_scores()
+                        with st.spinner("正在生成风险告警..."):
+                            generate_risk_alerts(risk_results, detection_run_id)
 
-                st.success("信号检测完成！风险评分已更新。")
+                st.success("信号检测完成！风险评分已更新，告警已生成。")
                 st.rerun()
 
     with col1:
@@ -913,8 +930,7 @@ def page_risk_assessment():
                         st.session_state.risk_page_tab = "风险排行看板"
                         st.rerun()
 
-    tab1, tab2 = st.tabs(["📋 风险排行看板", "📈 风险对比分析"])
-    st.session_state.risk_page_tab = "风险排行看板" if tab1 else "风险对比分析"
+    tab1, tab2, tab3 = st.tabs(["📋 风险排行看板", "📈 风险对比分析", "🎯 风险评分模拟器"])
 
     with tab1:
         st.session_state.risk_page_tab = "风险排行看板"
@@ -924,8 +940,42 @@ def page_risk_assessment():
         st.session_state.risk_page_tab = "风险对比分析"
         _display_risk_comparison(rdf)
 
+    with tab3:
+        st.session_state.risk_page_tab = "风险评分模拟器"
+        _display_risk_simulator(rdf)
+
 
 def _display_risk_dashboard(rdf):
+    risk_alerts = get_active_risk_alerts(limit=10)
+    if risk_alerts:
+        st.subheader("⚠️ 最新风险告警")
+        alert_type_labels = {
+            "continuous_rise": ("持续恶化", "#d62728"),
+            "jump": ("急剧变化", "#ff7f0e"),
+        }
+        for idx, alert in enumerate(risk_alerts):
+            alert_type, color = alert_type_labels.get(alert["alert_type"], ("未知", "#7f7f7f"))
+            change_str = f"{alert['change_amount']:+.1f}分" if alert["change_amount"] is not None else "N/A"
+            with st.container(border=True):
+                col_a, col_b, col_c, col_d, col_e = st.columns([3, 2, 2, 2, 1])
+                with col_a:
+                    st.markdown(f"**{alert['device_name']}**")
+                    st.caption(f"🕐 {alert['trigger_time']}")
+                with col_b:
+                    st.markdown(
+                        f"<span style='color:{color};font-weight:bold;background-color:#fff3e6;padding:4px 12px;border-radius:4px;'>{alert_type}</span>",
+                        unsafe_allow_html=True
+                    )
+                with col_c:
+                    st.metric("当前评分", f"{alert['current_score']:.0f}分")
+                with col_d:
+                    st.metric("变化幅度", change_str)
+                with col_e:
+                    if st.button("已确认", key=f"confirm_alert_{alert['id']}", type="primary"):
+                        confirm_risk_alert(alert["id"], confirmed_by="当前用户")
+                        st.rerun()
+        st.divider()
+
     st.subheader("📊 风险等级分布")
 
     level_counts = get_risk_level_counts()
@@ -1061,6 +1111,7 @@ def _display_risk_detail(device_name, row):
 
     detail = get_risk_score_detail(device_name)
     history = get_risk_score_history(device_name, limit=10)
+    weights = get_risk_weights()
 
     col1, col2 = st.columns([1, 1])
 
@@ -1068,10 +1119,10 @@ def _display_risk_detail(device_name, row):
         st.subheader("因子得分明细")
 
         factors = [
-            ("信号强度因子", row.get("signal_strength_score", 0), row.get("signal_strength_factor", 0), 0.40, "#1f77b4"),
-            ("报告频率因子", row.get("report_frequency_score", 0), row.get("report_frequency_factor", 0), 0.25, "#ff7f0e"),
-            ("严重程度因子", row.get("severity_score", 0), row.get("severity_factor", 0), 0.20, "#2ca02c"),
-            ("趋势因子", row.get("trend_score", 0), row.get("trend_factor", 0), 0.15, "#d62728"),
+            ("信号强度因子", row.get("signal_strength_score", 0), row.get("signal_strength_factor", 0), weights["signal_strength"], "#1f77b4"),
+            ("报告频率因子", row.get("report_frequency_score", 0), row.get("report_frequency_factor", 0), weights["report_frequency"], "#ff7f0e"),
+            ("严重程度因子", row.get("severity_score", 0), row.get("severity_factor", 0), weights["severity"], "#2ca02c"),
+            ("趋势因子", row.get("trend_score", 0), row.get("trend_factor", 0), weights["trend"], "#d62728"),
         ]
 
         for name, raw, weighted, weight, color in factors:
@@ -1353,6 +1404,165 @@ def _display_risk_comparison(rdf):
         st.info("暂无对比数据")
 
 
+def _display_risk_simulator(rdf):
+    st.subheader("🎯 风险评分模拟器")
+    st.info("调整四个因子的假设值，实时查看模拟评分和风险等级。")
+
+    col_input, col_result = st.columns([1, 1])
+
+    with col_input:
+        st.markdown("#### 输入因子值 (0-100)")
+
+        signal_val = st.slider(
+            "信号强度因子",
+            min_value=0,
+            max_value=100,
+            value=st.session_state.simulator_signal,
+            step=1,
+            key="sim_slider_signal"
+        )
+        freq_val = st.slider(
+            "报告频率因子",
+            min_value=0,
+            max_value=100,
+            value=st.session_state.simulator_frequency,
+            step=1,
+            key="sim_slider_freq"
+        )
+        severity_val = st.slider(
+            "严重程度因子",
+            min_value=0,
+            max_value=100,
+            value=st.session_state.simulator_severity,
+            step=1,
+            key="sim_slider_severity"
+        )
+        trend_val = st.slider(
+            "趋势因子",
+            min_value=0,
+            max_value=100,
+            value=st.session_state.simulator_trend,
+            step=1,
+            key="sim_slider_trend"
+        )
+
+        st.session_state.simulator_signal = signal_val
+        st.session_state.simulator_frequency = freq_val
+        st.session_state.simulator_severity = severity_val
+        st.session_state.simulator_trend = trend_val
+
+        factor_values = {
+            "signal_strength": signal_val,
+            "report_frequency": freq_val,
+            "severity": severity_val,
+            "trend": trend_val,
+        }
+
+        st.divider()
+        with st.form("save_scheme_form"):
+            scheme_name = st.text_input("方案名称", placeholder="输入方案名称以保存")
+            col_save, col_clear = st.columns(2)
+            with col_save:
+                save_submitted = st.form_submit_button("💾 保存方案", type="primary")
+            with col_clear:
+                clear_submitted = st.form_submit_button("🔄 重置为默认")
+
+            if save_submitted and scheme_name:
+                save_simulator_scheme(scheme_name, factor_values, created_by="当前用户")
+                st.success(f"方案 '{scheme_name}' 已保存！")
+                st.rerun()
+            if clear_submitted:
+                st.session_state.simulator_signal = 50
+                st.session_state.simulator_frequency = 50
+                st.session_state.simulator_severity = 50
+                st.session_state.simulator_trend = 50
+                st.rerun()
+
+    with col_result:
+        sim_result = calculate_simulated_score(factor_values)
+        rank = get_simulated_rank(sim_result["total_score"], rdf)
+
+        st.markdown("#### 模拟结果")
+
+        col_score, col_level = st.columns(2)
+        with col_score:
+            st.metric("模拟综合评分", f"{sim_result['total_score']:.1f}分")
+        with col_level:
+            st.markdown(
+                f"<div style='text-align:center;background-color:{sim_result['risk_color']};color:white;padding:16px;border-radius:8px;'>"
+                f"<h3 style='margin:0;'>{sim_result['risk_level']}</h3></div>",
+                unsafe_allow_html=True
+            )
+
+        if rank is not None:
+            total_devices = len(rdf) if not rdf.empty else 0
+            st.info(f"📊 如果器械达到此评分，将在 {total_devices} 个器械中排名第 **{rank}** 位")
+
+        st.divider()
+
+        col_w, col_b = st.columns(2)
+        with col_w:
+            st.metric("加权总分", f"{sim_result['weighted_total']:.1f}分")
+        with col_b:
+            st.metric("贝叶斯风险", f"{sim_result['bayesian_risk']:.1f}分")
+
+        st.markdown("#### 贝叶斯概率分布")
+        dist = sim_result["bayesian_distribution"]
+        dist_df = pd.DataFrame({
+            "风险等级": ["低风险", "中风险", "高风险"],
+            "概率": [dist["low"], dist["medium"], dist["high"]],
+        })
+        fig_dist = px.bar(dist_df, x="风险等级", y="概率", text="概率",
+                          color="风险等级",
+                          color_discrete_map={"低风险": "#2ca02c", "中风险": "#feca57", "高风险": "#d62728"})
+        fig_dist.update_layout(yaxis_tickformat='.0%', height=200)
+        fig_dist.update_traces(texttemplate='%{text:.1%}', textposition='outside')
+        st.plotly_chart(fig_dist, use_container_width=True, key="sim_bayesian")
+
+        st.markdown("#### 当前使用权重")
+        weights = sim_result["weights"]
+        weights_df = pd.DataFrame({
+            "因子": ["信号强度", "报告频率", "严重程度", "趋势"],
+            "权重": [weights["signal_strength"], weights["report_frequency"], weights["severity"], weights["trend"]],
+        })
+        fig_weights = px.pie(weights_df, values="权重", names="因子", hole=0.4,
+                             color_discrete_sequence=["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"])
+        fig_weights.update_layout(height=200)
+        st.plotly_chart(fig_weights, use_container_width=True, key="sim_weights")
+
+    st.divider()
+    st.subheader("📋 已保存的模拟方案")
+    schemes = get_simulator_schemes()
+
+    if not schemes:
+        st.info("暂无保存的方案")
+    else:
+        cols = st.columns(4)
+        for idx, scheme in enumerate(schemes):
+            with cols[idx % 4]:
+                with st.container(border=True):
+                    st.markdown(f"**{scheme['scheme_name']}**")
+                    st.caption(f"创建时间: {scheme['created_at']}")
+                    st.caption(
+                        f"信号:{scheme['signal_strength']:.0f} | "
+                        f"频率:{scheme['report_frequency']:.0f} | "
+                        f"严重:{scheme['severity']:.0f} | "
+                        f"趋势:{scheme['trend']:.0f}"
+                    )
+                    col_load, col_del = st.columns(2)
+                    with col_load:
+                        if st.button("加载", key=f"load_scheme_{scheme['id']}", use_container_width=True):
+                            st.session_state.simulator_signal = int(scheme['signal_strength'])
+                            st.session_state.simulator_frequency = int(scheme['report_frequency'])
+                            st.session_state.simulator_severity = int(scheme['severity'])
+                            st.session_state.simulator_trend = int(scheme['trend'])
+                            st.rerun()
+                    with col_del:
+                        if st.button("删除", key=f"del_scheme_{scheme['id']}", use_container_width=True):
+                            delete_simulator_scheme(scheme['id'])
+                            st.rerun()
+
+
 def page_config():
     st.title("⚙️ 检测参数配置")
 
@@ -1438,6 +1648,74 @@ def page_config():
             )
 
             st.divider()
+            st.markdown("#### 风险评分权重配置")
+            st.info("调整四个因子的权重百分比，总和必须等于100%。调高一个权重时，其他权重将按比例自动缩减。")
+
+            col_w1, col_w2, col_w3, col_w4 = st.columns(4)
+            with col_w1:
+                w_signal = st.slider(
+                    "信号强度权重 (%)",
+                    min_value=0,
+                    max_value=100,
+                    value=int(float(active_config.get("weight_signal_strength", 0.40)) * 100),
+                    step=1,
+                    key="cfg_weight_signal"
+                )
+            with col_w2:
+                w_freq = st.slider(
+                    "报告频率权重 (%)",
+                    min_value=0,
+                    max_value=100,
+                    value=int(float(active_config.get("weight_report_frequency", 0.25)) * 100),
+                    step=1,
+                    key="cfg_weight_freq"
+                )
+            with col_w3:
+                w_severity = st.slider(
+                    "严重程度权重 (%)",
+                    min_value=0,
+                    max_value=100,
+                    value=int(float(active_config.get("weight_severity", 0.20)) * 100),
+                    step=1,
+                    key="cfg_weight_severity"
+                )
+            with col_w4:
+                w_trend = st.slider(
+                    "趋势因子权重 (%)",
+                    min_value=0,
+                    max_value=100,
+                    value=int(float(active_config.get("weight_trend", 0.15)) * 100),
+                    step=1,
+                    key="cfg_weight_trend"
+                )
+
+            total_weight = w_signal + w_freq + w_severity + w_trend
+            if total_weight != 100:
+                st.warning(f"⚠️ 权重总和为 {total_weight}%，必须等于 100%。请调整权重。")
+
+            st.divider()
+            st.markdown("#### 风险告警规则配置")
+            col_alert1, col_alert2 = st.columns(2)
+            with col_alert1:
+                alert_continuous_n = st.number_input(
+                    "持续上升告警 - 连续N次",
+                    min_value=2,
+                    max_value=10,
+                    value=int(active_config.get("alert_continuous_rise_n", 3)),
+                    step=1,
+                    help="连续N次风险评分上升时触发'持续恶化'告警"
+                )
+            with col_alert2:
+                alert_jump_m = st.number_input(
+                    "急剧变化告警 - 单次跳变M分",
+                    min_value=1.0,
+                    max_value=50.0,
+                    value=float(active_config.get("alert_jump_m", 15.0)),
+                    step=0.5,
+                    help="单次评分变化超过M分时触发'急剧变化'告警"
+                )
+
+            st.divider()
             col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
             with col_btn1:
                 submitted = st.form_submit_button("💾 保存配置", type="primary", use_container_width=True)
@@ -1447,18 +1725,27 @@ def page_config():
                 operator = st.text_input("操作人", value="分析员")
 
             if submitted:
-                new_config = {
-                    "prr_threshold": prr_threshold,
-                    "min_report_count": min_report_count,
-                    "p_value_threshold": p_value_threshold,
-                    "ror_lower_threshold": ror_lower_threshold,
-                    "ic025_threshold": ic025_threshold,
-                    "eb05_threshold": eb05_threshold,
-                    "strong_signal_min_methods": strong_signal_min_methods,
-                }
-                save_new_config(new_config, created_by=operator)
-                st.success("配置已保存！下次信号检测将使用新参数。")
-                st.rerun()
+                if total_weight != 100:
+                    st.error(f"权重总和为 {total_weight}%，必须等于 100% 才能保存！")
+                else:
+                    new_config = {
+                        "prr_threshold": prr_threshold,
+                        "min_report_count": min_report_count,
+                        "p_value_threshold": p_value_threshold,
+                        "ror_lower_threshold": ror_lower_threshold,
+                        "ic025_threshold": ic025_threshold,
+                        "eb05_threshold": eb05_threshold,
+                        "strong_signal_min_methods": strong_signal_min_methods,
+                        "weight_signal_strength": w_signal / 100.0,
+                        "weight_report_frequency": w_freq / 100.0,
+                        "weight_severity": w_severity / 100.0,
+                        "weight_trend": w_trend / 100.0,
+                        "alert_continuous_rise_n": alert_continuous_n,
+                        "alert_jump_m": alert_jump_m,
+                    }
+                    save_new_config(new_config, created_by=operator)
+                    st.success("配置已保存！下次信号检测将使用新参数。")
+                    st.rerun()
 
             if reset:
                 reset_to_default()
@@ -1477,12 +1764,21 @@ def page_config():
             "ic025_threshold": "IC025阈值",
             "eb05_threshold": "EB05阈值",
             "strong_signal_min_methods": "强信号最少方法数",
+            "weight_signal_strength": "信号强度权重",
+            "weight_report_frequency": "报告频率权重",
+            "weight_severity": "严重程度权重",
+            "weight_trend": "趋势因子权重",
+            "alert_continuous_rise_n": "持续上升N次",
+            "alert_jump_m": "跳变阈值M分",
         }
 
         for key, label in param_labels.items():
             default_val = DEFAULT_CONFIG.get(key, "-")
             current_val = current.get(key, "-")
-            is_changed = default_val != current_val
+            if key.startswith("weight_"):
+                default_val = f"{float(default_val) * 100:.0f}%"
+                current_val = f"{float(current_val) * 100:.0f}%"
+            is_changed = str(default_val) != str(current_val)
             comparison_data.append({
                 "参数": label,
                 "默认值": default_val,
@@ -1628,6 +1924,90 @@ def page_export():
                                 else:
                                     new_prr = "N/A"
                                 st.caption(f"PRR: {old_prr} → {new_prr}")
+
+    st.divider()
+    st.subheader("📊 风险评分批量导出")
+
+    if st.session_state.risk_scores_df.empty:
+        st.session_state.risk_scores_df = load_risk_scores()
+
+    if st.session_state.risk_scores_df.empty:
+        st.info("暂无风险评分数据，请先运行信号检测")
+    else:
+        export_data = get_risk_scores_for_export()
+        st.info(f"共 {len(export_data)} 条风险评分数据可导出")
+
+        col_exp1, col_exp2, col_exp3 = st.columns([2, 1, 1])
+        with col_exp1:
+            export_format = st.selectbox(
+                "选择导出格式",
+                ["CSV", "JSON"],
+                key="risk_export_format"
+            )
+        with col_exp2:
+            st.write("")
+            st.write("")
+            preview_btn = st.button("📋 预览导出字段", use_container_width=True)
+        with col_exp3:
+            st.write("")
+            st.write("")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            if export_format == "CSV":
+                export_df = pd.DataFrame(export_data)
+                csv_data = export_df.to_csv(index=False, encoding="utf-8-sig")
+                st.download_button(
+                    label="📥 导出CSV",
+                    data=csv_data,
+                    file_name=f"risk_scores_{timestamp}.csv",
+                    mime="text/csv",
+                    type="primary",
+                    use_container_width=True,
+                )
+            else:
+                json_data = json.dumps(export_data, ensure_ascii=False, indent=2, default=str)
+                st.download_button(
+                    label="📥 导出JSON",
+                    data=json_data,
+                    file_name=f"risk_scores_{timestamp}.json",
+                    mime="application/json",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+        if preview_btn:
+            st.markdown("#### 导出字段说明")
+            field_descriptions = [
+                {"字段名": "device_name", "说明": "器械名称"},
+                {"字段名": "total_score", "说明": "综合风险评分(0-100)"},
+                {"字段名": "risk_level", "说明": "风险等级(极高/高/中等/低/极低)"},
+                {"字段名": "risk_color_hex", "说明": "风险等级颜色代码(HEX值)"},
+                {"字段名": "signal_strength_score", "说明": "信号强度因子原始分"},
+                {"字段名": "signal_strength_weighted", "说明": "信号强度因子加权分"},
+                {"字段名": "report_frequency_score", "说明": "报告频率因子原始分"},
+                {"字段名": "report_frequency_weighted", "说明": "报告频率因子加权分"},
+                {"字段名": "severity_score", "说明": "严重程度因子原始分"},
+                {"字段名": "severity_weighted", "说明": "严重程度因子加权分"},
+                {"字段名": "trend_score", "说明": "趋势因子原始分"},
+                {"字段名": "trend_weighted", "说明": "趋势因子加权分"},
+                {"字段名": "weight_signal_strength", "说明": "信号强度权重值"},
+                {"字段名": "weight_report_frequency", "说明": "报告频率权重值"},
+                {"字段名": "weight_severity", "说明": "严重程度权重值"},
+                {"字段名": "weight_trend", "说明": "趋势权重值"},
+                {"字段名": "bayesian_risk", "说明": "贝叶斯网络风险评分"},
+                {"字段名": "bayesian_prob_low", "说明": "贝叶斯低风险概率"},
+                {"字段名": "bayesian_prob_medium", "说明": "贝叶斯中风险概率"},
+                {"字段名": "bayesian_prob_high", "说明": "贝叶斯高风险概率"},
+                {"字段名": "last_score_change", "说明": "最近一次评分变化幅度"},
+                {"字段名": "has_active_alert", "说明": "是否有活跃告警"},
+                {"字段名": "prediction_trend", "说明": "预测走势(升/降/稳)"},
+                {"字段名": "is_upgrade_alert", "说明": "是否为预警升级"},
+            ]
+            field_df = pd.DataFrame(field_descriptions)
+            st.dataframe(field_df, use_container_width=True, hide_index=True)
+
+            st.markdown("#### 数据预览(前5条)")
+            preview_df = pd.DataFrame(export_data).head(5)
+            st.dataframe(preview_df, use_container_width=True)
 
 
 def page_review_kanban():

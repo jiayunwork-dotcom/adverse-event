@@ -7,14 +7,10 @@ from db import get_db
 from algorithms import load_signals
 from time_analysis import compute_monthly_counts, compute_cusum, detect_trend
 from data_import import load_reports
+from config_manager import get_risk_weights, DEFAULT_WEIGHTS
 
 
-WEIGHTS = {
-    "signal_strength": 0.40,
-    "report_frequency": 0.25,
-    "severity": 0.20,
-    "trend": 0.15,
-}
+DEFAULT_WEIGHTS_CONFIG = DEFAULT_WEIGHTS
 
 SIGNAL_STRENGTH_MAP = {
     "强信号": 100,
@@ -150,7 +146,9 @@ class BayesianNetwork:
         }
 
 
-def calculate_signal_strength_factor(device_name, signals_df=None):
+def calculate_signal_strength_factor(device_name, signals_df=None, weights=None):
+    if weights is None:
+        weights = get_risk_weights()
     if signals_df is None:
         signals_df = load_signals()
 
@@ -168,11 +166,13 @@ def calculate_signal_strength_factor(device_name, signals_df=None):
         if score > max_strength_score:
             max_strength_score = score
 
-    weighted_score = max_strength_score * WEIGHTS["signal_strength"]
+    weighted_score = max_strength_score * weights["signal_strength"]
     return max_strength_score, weighted_score
 
 
-def calculate_report_frequency_factor(device_name, reports_df=None):
+def calculate_report_frequency_factor(device_name, reports_df=None, weights=None):
+    if weights is None:
+        weights = get_risk_weights()
     if reports_df is None:
         reports_df = load_reports()
 
@@ -237,12 +237,14 @@ def calculate_report_frequency_factor(device_name, reports_df=None):
         raw_score = ratio * 20
 
     raw_score = max(0, min(100, raw_score))
-    weighted_score = raw_score * WEIGHTS["report_frequency"]
+    weighted_score = raw_score * weights["report_frequency"]
 
     return raw_score, weighted_score
 
 
-def calculate_severity_factor(device_name, reports_df=None):
+def calculate_severity_factor(device_name, reports_df=None, weights=None):
+    if weights is None:
+        weights = get_risk_weights()
     if reports_df is None:
         reports_df = load_reports()
 
@@ -266,12 +268,14 @@ def calculate_severity_factor(device_name, reports_df=None):
     raw_score = (death_ratio * 100) + (severe_ratio * 50)
     raw_score = max(0, min(100, raw_score))
 
-    weighted_score = raw_score * WEIGHTS["severity"]
+    weighted_score = raw_score * weights["severity"]
 
     return raw_score, weighted_score
 
 
-def calculate_trend_factor(device_name, reports_df=None):
+def calculate_trend_factor(device_name, reports_df=None, weights=None):
+    if weights is None:
+        weights = get_risk_weights()
     if reports_df is None:
         reports_df = load_reports()
 
@@ -302,21 +306,23 @@ def calculate_trend_factor(device_name, reports_df=None):
     else:
         raw_score = 20
 
-    weighted_score = raw_score * WEIGHTS["trend"]
+    weighted_score = raw_score * weights["trend"]
 
     return raw_score, weighted_score
 
 
-def calculate_risk_score(device_name, signals_df=None, reports_df=None, detection_run_id=None):
+def calculate_risk_score(device_name, signals_df=None, reports_df=None, detection_run_id=None, weights=None):
+    if weights is None:
+        weights = get_risk_weights()
     if reports_df is None:
         reports_df = load_reports()
     if signals_df is None:
         signals_df = load_signals()
 
-    signal_score, signal_weighted = calculate_signal_strength_factor(device_name, signals_df)
-    freq_score, freq_weighted = calculate_report_frequency_factor(device_name, reports_df)
-    severity_score, severity_weighted = calculate_severity_factor(device_name, reports_df)
-    trend_score, trend_weighted = calculate_trend_factor(device_name, reports_df)
+    signal_score, signal_weighted = calculate_signal_strength_factor(device_name, signals_df, weights)
+    freq_score, freq_weighted = calculate_report_frequency_factor(device_name, reports_df, weights)
+    severity_score, severity_weighted = calculate_severity_factor(device_name, reports_df, weights)
+    trend_score, trend_weighted = calculate_trend_factor(device_name, reports_df, weights)
 
     total_score = signal_weighted + freq_weighted + severity_weighted + trend_weighted
     total_score = max(0, min(100, total_score))
@@ -358,6 +364,7 @@ def calculate_risk_score(device_name, signals_df=None, reports_df=None, detectio
         "prediction_values": predictions,
         "is_upgrade_alert": is_upgrade_alert,
         "detection_run_id": detection_run_id,
+        "weights": weights,
     }
 
 
@@ -429,6 +436,7 @@ def save_risk_scores(risk_results, detection_run_id=None):
 
             pred_json = json.dumps(result["prediction_values"], ensure_ascii=False)
 
+            weights = result.get("weights", {})
             if existing:
                 conn.execute(
                     """
@@ -440,7 +448,10 @@ def save_risk_scores(risk_results, detection_run_id=None):
                         trend_factor = ?, trend_score = ?,
                         bayesian_risk = ?, prediction_trend = ?,
                         prediction_values = ?, is_upgrade_alert = ?,
-                        detection_run_id = ?, updated_at = CURRENT_TIMESTAMP
+                        detection_run_id = ?,
+                        weight_signal_strength = ?, weight_report_frequency = ?,
+                        weight_severity = ?, weight_trend = ?,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE device_name = ?
                     """,
                     (
@@ -451,7 +462,12 @@ def save_risk_scores(risk_results, detection_run_id=None):
                         result["trend_weighted"], result["trend_score"],
                         result["bayesian_risk"], result["prediction_trend"],
                         pred_json, 1 if result["is_upgrade_alert"] else 0,
-                        detection_run_id, result["device_name"],
+                        detection_run_id,
+                        weights.get("signal_strength", 0.40),
+                        weights.get("report_frequency", 0.25),
+                        weights.get("severity", 0.20),
+                        weights.get("trend", 0.15),
+                        result["device_name"],
                     )
                 )
             else:
@@ -464,8 +480,10 @@ def save_risk_scores(risk_results, detection_run_id=None):
                         severity_factor, severity_score,
                         trend_factor, trend_score,
                         bayesian_risk, prediction_trend,
-                        prediction_values, is_upgrade_alert, detection_run_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        prediction_values, is_upgrade_alert, detection_run_id,
+                        weight_signal_strength, weight_report_frequency,
+                        weight_severity, weight_trend
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         result["device_name"], result["total_score"], result["risk_level"],
@@ -475,6 +493,10 @@ def save_risk_scores(risk_results, detection_run_id=None):
                         result["trend_weighted"], result["trend_score"],
                         result["bayesian_risk"], result["prediction_trend"],
                         pred_json, 1 if result["is_upgrade_alert"] else 0, detection_run_id,
+                        weights.get("signal_strength", 0.40),
+                        weights.get("report_frequency", 0.25),
+                        weights.get("severity", 0.20),
+                        weights.get("trend", 0.15),
                     )
                 )
 
@@ -517,11 +539,12 @@ def calculate_all_risk_scores(detection_run_id=None):
     if reports_df.empty:
         return []
 
+    weights = get_risk_weights()
     all_devices = reports_df["device_name"].unique().tolist()
     results = []
 
     for device in all_devices:
-        result = calculate_risk_score(device, signals_df, reports_df, detection_run_id)
+        result = calculate_risk_score(device, signals_df, reports_df, detection_run_id, weights)
         results.append(result)
 
     save_risk_scores(results, detection_run_id)
@@ -665,3 +688,300 @@ def generate_comparison_summary(devices_data):
         summary += f"相比之下，{lowest['device_name']}风险最低({lowest['total_score']:.0f}分)。"
 
     return summary
+
+
+def generate_risk_alerts(risk_results, detection_run_id=None):
+    from config_manager import get_alert_config
+    alert_config = get_alert_config()
+    n = alert_config["continuous_rise_n"]
+    m = alert_config["jump_m"]
+
+    alerts = []
+
+    for result in risk_results:
+        device_name = result["device_name"]
+        current_score = result["total_score"]
+        history = get_risk_score_history(device_name, limit=n + 1)
+
+        if len(history) >= n:
+            scores = [h["total_score"] for h in history[-n:]]
+            is_continuous_rise = all(scores[i] < scores[i + 1] for i in range(len(scores) - 1))
+            if is_continuous_rise:
+                prev_score = history[-2]["total_score"] if len(history) >= 2 else None
+                change_amount = current_score - prev_score if prev_score else None
+                alerts.append({
+                    "device_name": device_name,
+                    "alert_type": "continuous_rise",
+                    "current_score": current_score,
+                    "previous_score": prev_score,
+                    "change_amount": change_amount,
+                    "detection_run_id": detection_run_id,
+                })
+
+        if len(history) >= 2:
+            prev_score = history[-2]["total_score"]
+            change_amount = abs(current_score - prev_score)
+            if change_amount >= m:
+                alerts.append({
+                    "device_name": device_name,
+                    "alert_type": "jump",
+                    "current_score": current_score,
+                    "previous_score": prev_score,
+                    "change_amount": current_score - prev_score,
+                    "detection_run_id": detection_run_id,
+                })
+
+    if alerts:
+        with get_db() as conn:
+            conn.executemany(
+                """
+                INSERT INTO risk_alerts (
+                    device_name, alert_type, current_score,
+                    previous_score, change_amount, detection_run_id
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        a["device_name"],
+                        a["alert_type"],
+                        a["current_score"],
+                        a["previous_score"],
+                        a["change_amount"],
+                        a["detection_run_id"],
+                    )
+                    for a in alerts
+                ],
+            )
+
+    return alerts
+
+
+def get_active_risk_alerts(limit=10):
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM risk_alerts
+            WHERE is_confirmed = 0
+            ORDER BY trigger_time DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_all_risk_alerts(limit=100):
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM risk_alerts
+            ORDER BY trigger_time DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def confirm_risk_alert(alert_id, confirmed_by="用户"):
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE risk_alerts
+            SET is_confirmed = 1, confirmed_by = ?, confirmed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (confirmed_by, alert_id),
+        )
+
+
+def get_last_score_change(device_name):
+    history = get_risk_score_history(device_name, limit=2)
+    if len(history) >= 2:
+        return history[-1]["total_score"] - history[-2]["total_score"]
+    return None
+
+
+def has_active_alert(device_name):
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) as cnt FROM risk_alerts
+            WHERE device_name = ? AND is_confirmed = 0
+            """,
+            (device_name,),
+        ).fetchone()
+        return row["cnt"] > 0
+
+
+def calculate_simulated_score(factor_values, weights=None):
+    if weights is None:
+        weights = get_risk_weights()
+
+    signal_score = factor_values.get("signal_strength", 0)
+    freq_score = factor_values.get("report_frequency", 0)
+    severity_score = factor_values.get("severity", 0)
+    trend_score = factor_values.get("trend", 0)
+
+    weighted_total = (
+        signal_score * weights["signal_strength"] +
+        freq_score * weights["report_frequency"] +
+        severity_score * weights["severity"] +
+        trend_score * weights["trend"]
+    )
+    weighted_total = max(0, min(100, weighted_total))
+
+    bayesian = BayesianNetwork()
+    bayesian_result = bayesian.infer({
+        "signal_strength": signal_score,
+        "report_frequency": freq_score,
+        "severity": severity_score,
+        "trend": trend_score,
+    })
+    bayesian_risk = bayesian_result["bayesian_score"]
+
+    final_score = (weighted_total * 0.7) + (bayesian_risk * 0.3)
+    final_score = max(0, min(100, final_score))
+
+    risk_level, risk_color = get_risk_level(final_score)
+
+    return {
+        "total_score": final_score,
+        "risk_level": risk_level,
+        "risk_color": risk_color,
+        "weighted_total": weighted_total,
+        "bayesian_risk": bayesian_risk,
+        "bayesian_distribution": bayesian_result["risk_distribution"],
+        "weights": weights,
+    }
+
+
+def get_simulated_rank(simulated_score, risk_scores_df=None):
+    if risk_scores_df is None:
+        risk_scores_df = load_risk_scores()
+
+    if risk_scores_df.empty:
+        return None
+
+    all_scores = risk_scores_df["total_score"].tolist()
+    all_scores.append(simulated_score)
+    all_scores.sort(reverse=True)
+
+    rank = all_scores.index(simulated_score) + 1
+    return rank
+
+
+def save_simulator_scheme(scheme_name, factor_values, created_by="用户"):
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO risk_simulator_schemes (
+                scheme_name, signal_strength, report_frequency,
+                severity, trend, created_by
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scheme_name,
+                factor_values.get("signal_strength", 0),
+                factor_values.get("report_frequency", 0),
+                factor_values.get("severity", 0),
+                factor_values.get("trend", 0),
+                created_by,
+            ),
+        )
+
+
+def get_simulator_schemes():
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM risk_simulator_schemes
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_simulator_scheme(scheme_id):
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM risk_simulator_schemes WHERE id = ?",
+            (scheme_id,),
+        )
+
+
+def get_risk_scores_for_export():
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT rs.*,
+                   ra.is_confirmed as has_active_alert_raw
+            FROM risk_scores rs
+            LEFT JOIN risk_alerts ra ON rs.device_name = ra.device_name AND ra.is_confirmed = 0
+            ORDER BY rs.total_score DESC
+            """
+        ).fetchall()
+
+        results = []
+        seen_devices = set()
+
+        for row in rows:
+            r = dict(row)
+            device_name = r["device_name"]
+
+            if device_name in seen_devices:
+                continue
+            seen_devices.add(device_name)
+
+            risk_level = r.get("risk_level", "极低风险")
+            level_info = get_risk_level_info(risk_level)
+
+            last_change = get_last_score_change(device_name)
+
+            history = get_risk_score_history(device_name, limit=1)
+            bayesian_result = None
+            if history:
+                latest = history[0]
+                bayesian = BayesianNetwork()
+                bayesian_result = bayesian.infer({
+                    "signal_strength": latest.get("signal_strength_score", 0),
+                    "report_frequency": latest.get("report_frequency_score", 0),
+                    "severity": latest.get("severity_score", 0),
+                    "trend": latest.get("trend_score", 0),
+                })
+
+            if bayesian_result is None:
+                bayesian_result = {
+                    "risk_distribution": {"low": 0.0, "medium": 0.0, "high": 0.0}
+                }
+
+            has_active = has_active_alert(device_name)
+
+            results.append({
+                "device_name": device_name,
+                "total_score": r.get("total_score", 0),
+                "risk_level": risk_level,
+                "risk_color_hex": level_info.get("color", "#7f7f7f"),
+                "signal_strength_score": r.get("signal_strength_score", 0),
+                "signal_strength_weighted": r.get("signal_strength_factor", 0),
+                "report_frequency_score": r.get("report_frequency_score", 0),
+                "report_frequency_weighted": r.get("report_frequency_factor", 0),
+                "severity_score": r.get("severity_score", 0),
+                "severity_weighted": r.get("severity_factor", 0),
+                "trend_score": r.get("trend_score", 0),
+                "trend_weighted": r.get("trend_factor", 0),
+                "weight_signal_strength": r.get("weight_signal_strength", 0.40),
+                "weight_report_frequency": r.get("weight_report_frequency", 0.25),
+                "weight_severity": r.get("weight_severity", 0.20),
+                "weight_trend": r.get("weight_trend", 0.15),
+                "bayesian_risk": r.get("bayesian_risk", 0),
+                "bayesian_prob_low": bayesian_result["risk_distribution"].get("low", 0),
+                "bayesian_prob_medium": bayesian_result["risk_distribution"].get("medium", 0),
+                "bayesian_prob_high": bayesian_result["risk_distribution"].get("high", 0),
+                "last_score_change": last_change if last_change is not None else 0,
+                "has_active_alert": has_active,
+                "prediction_trend": r.get("prediction_trend", "稳"),
+                "is_upgrade_alert": bool(r.get("is_upgrade_alert", 0)),
+            })
+
+        return results

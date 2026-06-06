@@ -141,10 +141,49 @@ def init_db():
             ic025_threshold REAL DEFAULT 0.0,
             eb05_threshold REAL DEFAULT 2.0,
             strong_signal_min_methods INTEGER DEFAULT 3,
+            weight_signal_strength REAL DEFAULT 0.40,
+            weight_report_frequency REAL DEFAULT 0.25,
+            weight_severity REAL DEFAULT 0.20,
+            weight_trend REAL DEFAULT 0.15,
+            alert_continuous_rise_n INTEGER DEFAULT 3,
+            alert_jump_m REAL DEFAULT 15.0,
             is_active INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             created_by TEXT DEFAULT '系统'
         );
+
+        CREATE TABLE IF NOT EXISTS risk_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_name TEXT NOT NULL,
+            alert_type TEXT NOT NULL CHECK(alert_type IN ('continuous_rise', 'jump')),
+            current_score REAL NOT NULL,
+            previous_score REAL,
+            change_amount REAL,
+            trigger_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_confirmed INTEGER DEFAULT 0,
+            confirmed_by TEXT,
+            confirmed_at TIMESTAMP,
+            detection_run_id INTEGER,
+            FOREIGN KEY (detection_run_id) REFERENCES detection_runs(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_risk_alerts_device ON risk_alerts(device_name);
+        CREATE INDEX IF NOT EXISTS idx_risk_alerts_type ON risk_alerts(alert_type);
+        CREATE INDEX IF NOT EXISTS idx_risk_alerts_confirmed ON risk_alerts(is_confirmed);
+        CREATE INDEX IF NOT EXISTS idx_risk_alerts_time ON risk_alerts(trigger_time);
+
+        CREATE TABLE IF NOT EXISTS risk_simulator_schemes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scheme_name TEXT NOT NULL,
+            signal_strength REAL NOT NULL,
+            report_frequency REAL NOT NULL,
+            severity REAL NOT NULL,
+            trend REAL NOT NULL,
+            created_by TEXT DEFAULT '用户',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sim_schemes_name ON risk_simulator_schemes(scheme_name);
 
         CREATE INDEX IF NOT EXISTS idx_config_active ON detection_config(is_active);
 
@@ -214,6 +253,10 @@ def init_db():
             prediction_values TEXT,
             is_upgrade_alert INTEGER DEFAULT 0,
             detection_run_id INTEGER,
+            weight_signal_strength REAL DEFAULT 0.40,
+            weight_report_frequency REAL DEFAULT 0.25,
+            weight_severity REAL DEFAULT 0.20,
+            weight_trend REAL DEFAULT 0.15,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (detection_run_id) REFERENCES detection_runs(id)

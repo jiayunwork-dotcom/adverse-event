@@ -8,6 +8,19 @@ DEFAULT_CONFIG = {
     "ic025_threshold": 0.0,
     "eb05_threshold": 2.0,
     "strong_signal_min_methods": 3,
+    "weight_signal_strength": 0.40,
+    "weight_report_frequency": 0.25,
+    "weight_severity": 0.20,
+    "weight_trend": 0.15,
+    "alert_continuous_rise_n": 3,
+    "alert_jump_m": 15.0,
+}
+
+DEFAULT_WEIGHTS = {
+    "signal_strength": 0.40,
+    "report_frequency": 0.25,
+    "severity": 0.20,
+    "trend": 0.15,
 }
 
 
@@ -20,8 +33,12 @@ def init_default_config():
                 INSERT INTO detection_config 
                 (prr_threshold, min_report_count, p_value_threshold, 
                  ror_lower_threshold, ic025_threshold, eb05_threshold, 
-                 strong_signal_min_methods, is_active, created_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1, '系统')
+                 strong_signal_min_methods, 
+                 weight_signal_strength, weight_report_frequency, 
+                 weight_severity, weight_trend,
+                 alert_continuous_rise_n, alert_jump_m,
+                 is_active, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, '系统')
                 """,
                 (
                     DEFAULT_CONFIG["prr_threshold"],
@@ -31,8 +48,32 @@ def init_default_config():
                     DEFAULT_CONFIG["ic025_threshold"],
                     DEFAULT_CONFIG["eb05_threshold"],
                     DEFAULT_CONFIG["strong_signal_min_methods"],
+                    DEFAULT_CONFIG["weight_signal_strength"],
+                    DEFAULT_CONFIG["weight_report_frequency"],
+                    DEFAULT_CONFIG["weight_severity"],
+                    DEFAULT_CONFIG["weight_trend"],
+                    DEFAULT_CONFIG["alert_continuous_rise_n"],
+                    DEFAULT_CONFIG["alert_jump_m"],
                 ),
             )
+
+
+def get_risk_weights():
+    config = get_active_config()
+    return {
+        "signal_strength": float(config.get("weight_signal_strength", DEFAULT_WEIGHTS["signal_strength"])),
+        "report_frequency": float(config.get("weight_report_frequency", DEFAULT_WEIGHTS["report_frequency"])),
+        "severity": float(config.get("weight_severity", DEFAULT_WEIGHTS["severity"])),
+        "trend": float(config.get("weight_trend", DEFAULT_WEIGHTS["trend"])),
+    }
+
+
+def get_alert_config():
+    config = get_active_config()
+    return {
+        "continuous_rise_n": int(config.get("alert_continuous_rise_n", 3)),
+        "jump_m": float(config.get("alert_jump_m", 15.0)),
+    }
 
 
 def get_active_config():
@@ -66,8 +107,12 @@ def save_new_config(config, created_by="用户"):
             INSERT INTO detection_config 
             (prr_threshold, min_report_count, p_value_threshold, 
              ror_lower_threshold, ic025_threshold, eb05_threshold, 
-             strong_signal_min_methods, is_active, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+             strong_signal_min_methods, 
+             weight_signal_strength, weight_report_frequency, 
+             weight_severity, weight_trend,
+             alert_continuous_rise_n, alert_jump_m,
+             is_active, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             """,
             (
                 float(config["prr_threshold"]),
@@ -77,6 +122,12 @@ def save_new_config(config, created_by="用户"):
                 float(config["ic025_threshold"]),
                 float(config["eb05_threshold"]),
                 int(config["strong_signal_min_methods"]),
+                float(config["weight_signal_strength"]),
+                float(config["weight_report_frequency"]),
+                float(config["weight_severity"]),
+                float(config["weight_trend"]),
+                int(config["alert_continuous_rise_n"]),
+                float(config["alert_jump_m"]),
                 created_by,
             ),
         )
